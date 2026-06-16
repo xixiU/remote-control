@@ -1,6 +1,7 @@
 // RemoteControl 前端
 // M1：WebSocket 连接 + 密码认证。
 // M2：在认证后采集鼠标/键盘事件，归一化坐标后发送到服务端注入到被控端。
+// M3：WebCodecs 解码视频流，渲染到 canvas。
 
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
@@ -9,10 +10,24 @@ const passwordEl = document.getElementById('password');
 const controlPanelEl = document.getElementById('control-panel');
 const surfaceEl = document.getElementById('control-surface');
 const controlHintEl = document.getElementById('control-hint');
+const canvasEl = document.getElementById('video-canvas');
 
 let ws = null;
 let helloReceived = false;
 let inputBound = false;
+
+// M3: 视频解码器
+let videoDecoder = null;
+let canvasCtx = null;
+let screenWidth = 1920;
+let screenHeight = 1080;
+
+// 服务端按 NAL 单元逐个下发：SPS / PPS / IDR 各是一个独立包。
+// WebCodecs 要求关键帧 chunk 内联 SPS+PPS，且 configure 后首个 chunk 必须是 key。
+// 这里缓存最近的参数集，遇到 IDR 时拼到前面组成完整的关键帧。
+let cachedSps = null;
+let cachedPps = null;
+let keyFrameDecoded = false; // 在收到首个关键帧前，丢弃所有 P 帧
 
 // 鼠标移动节流：~60Hz（≈16ms）。最后一帧未发送时记下，下一窗口补发。
 const MOVE_THROTTLE_MS = 16;
@@ -51,6 +66,12 @@ function connect() {
     };
 
     ws.onmessage = (ev) => {
+        // M3: 处理二进制视频帧
+        if (ev.data instanceof Blob || ev.data instanceof ArrayBuffer) {
+            handleVideoFrame(ev.data);
+            return;
+        }
+
         let msg;
         try {
             msg = JSON.parse(ev.data);
@@ -80,6 +101,14 @@ function handleMessage(msg) {
             setStatus('已连接，发送认证', 'connecting');
             hintEl.textContent = `服务端协议 v${msg.version}，编码 ${msg.video_codec}。`;
             sendAuth();
+            break;
+        case 'screen_info':
+            // M3: 收到屏幕信息，初始化解码器
+            screenWidth = msg.width;
+            screenHeight = msg.height;
+            canvasEl.width = screenWidth;
+            canvasEl.height = screenHeight;
+            initVideoDecoder();
             break;
         case 'auth_ok':
             setStatus('Ready to control', 'ok');
@@ -242,3 +271,162 @@ formEl.addEventListener('submit', (ev) => {
         connect();
     }
 });
+
+// ========== M3: 视频解码 ==========
+
+/// 初始化 WebCodecs VideoDecoder
+///
+/// 注意：此处只创建解码器，不立即 configure。真实的 codec 字符串
+/// （profile/level）要等收到 SPS 后从码流里解析，写死会和实际码流不符。
+function initVideoDecoder() {
+    if (!('VideoDecoder' in window)) {
+        console.error('浏览器不支持 WebCodecs API');
+        controlHintEl.textContent = '浏览器不支持 WebCodecs，无法显示画面（输入仍可用）';
+        return;
+    }
+
+    canvasCtx = canvasEl.getContext('2d');
+
+    videoDecoder = new VideoDecoder({
+        output: (frame) => {
+            // 将解码后的帧绘制到 canvas
+            canvasCtx.drawImage(frame, 0, 0, canvasEl.width, canvasEl.height);
+            frame.close();
+        },
+        error: (e) => {
+            console.error('视频解码错误:', e);
+        }
+    });
+
+    console.log('VideoDecoder 已创建，等待 SPS 配置');
+}
+
+/// 根据 SPS 负载里的 profile_idc / constraint_flags / level_idc 配置解码器。
+/// codec 字符串格式：avc1.PPCCLL（各两位十六进制）。
+function configureDecoderFromSps(sps) {
+    // 跳过 Annex-B 起始码与 NAL 头(0x67)，取后续三字节。
+    let i = 0;
+    if (sps.length >= 4 && sps[0] === 0 && sps[1] === 0 && sps[2] === 0 && sps[3] === 1) i = 4;
+    else if (sps.length >= 3 && sps[0] === 0 && sps[1] === 0 && sps[2] === 1) i = 3;
+    // i 指向 NAL 头字节，其后依次是 profile_idc, constraint_flags, level_idc。
+    const profile = sps[i + 1];
+    const constraint = sps[i + 2];
+    const level = sps[i + 3];
+    const hex = (n) => n.toString(16).padStart(2, '0');
+    const codec = `avc1.${hex(profile)}${hex(constraint)}${hex(level)}`;
+
+    videoDecoder.configure({
+        codec,
+        optimizeForLatency: true,
+    });
+    console.log('VideoDecoder 已配置:', codec);
+}
+
+/// 处理接收到的视频帧
+function handleVideoFrame(data) {
+    // 解码器尚未创建时直接丢弃；configure 由 SPS 触发，故这里不再要求已 configured。
+    if (!videoDecoder) {
+        return;
+    }
+
+    // 将 Blob 转换为 ArrayBuffer
+    if (data instanceof Blob) {
+        data.arrayBuffer().then(buf => processVideoPacket(buf));
+    } else {
+        processVideoPacket(data);
+    }
+}
+
+/// 解析并解码视频包
+///
+/// 服务端逐 NAL 下发：frame_type 1=IDR, 2=P帧, 3=参数集(SPS/PPS)。
+/// 参数集本身不解码，缓存起来；遇到 IDR 时拼成 [SPS][PPS][IDR] 一个 key chunk。
+function processVideoPacket(buffer) {
+    const view = new DataView(buffer);
+
+    // 解析帧头（16 字节）
+    const magic = view.getUint8(0);
+    if (magic !== 0xAB) {
+        console.warn('无效的视频帧 magic:', magic);
+        return;
+    }
+
+    const frameType = view.getUint8(1);
+    const timestampUs = view.getBigUint64(8, true);
+
+    // H.264 负载（从字节 16 开始）。复制一份，避免后续缓存引用到整个 buffer。
+    const payload = new Uint8Array(buffer.slice(16));
+
+    // 参数集：缓存，不直接解码。SPS 的 NAL 类型为 7，PPS 为 8。
+    if (frameType === 3) {
+        const nalType = nalUnitType(payload);
+        if (nalType === 7) {
+            cachedSps = payload;
+            // 首次拿到 SPS 时按真实 profile/level 配置解码器。
+            if (videoDecoder.state === 'unconfigured') {
+                configureDecoderFromSps(payload);
+            }
+        } else if (nalType === 8) {
+            cachedPps = payload;
+        }
+        return;
+    }
+
+    // 解码器还没配好（尚未收到 SPS）时丢弃。
+    if (videoDecoder.state !== 'configured') {
+        return;
+    }
+
+    let data;
+    let chunkType;
+    if (frameType === 1) {
+        // IDR 关键帧：必须内联 SPS/PPS，否则解码器无法解码。
+        if (!cachedSps || !cachedPps) {
+            // 尚未收到参数集，等下一个关键帧。
+            return;
+        }
+        data = concatBytes(cachedSps, cachedPps, payload);
+        chunkType = 'key';
+        keyFrameDecoded = true;
+    } else {
+        // P 帧：在收到首个关键帧之前丢弃，否则解码器报错。
+        if (!keyFrameDecoded) return;
+        data = payload;
+        chunkType = 'delta';
+    }
+
+    const chunk = new EncodedVideoChunk({
+        type: chunkType,
+        timestamp: Number(timestampUs),
+        data,
+    });
+
+    try {
+        videoDecoder.decode(chunk);
+    } catch (e) {
+        console.error('解码失败:', e);
+    }
+}
+
+/// 取 Annex-B NAL 单元的类型（跳过 3 或 4 字节起始码后，首字节低 5 位）。
+function nalUnitType(bytes) {
+    let i = 0;
+    if (bytes.length >= 4 && bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 0 && bytes[3] === 1) {
+        i = 4;
+    } else if (bytes.length >= 3 && bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1) {
+        i = 3;
+    }
+    return bytes[i] & 0x1f;
+}
+
+/// 拼接多个 Uint8Array。
+function concatBytes(...arrays) {
+    const total = arrays.reduce((sum, a) => sum + a.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const a of arrays) {
+        out.set(a, offset);
+        offset += a.length;
+    }
+    return out;
+}

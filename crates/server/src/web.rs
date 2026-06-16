@@ -17,21 +17,25 @@ use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::input::{self, InputInjector, MouseButton};
+use crate::pipeline::CaptureEncoder;
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
 use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
 
-/// M2 临时硬编码屏幕分辨率：M3 屏幕捕获就位后改用真实分辨率。
-const SCREEN_WIDTH: i32 = 1920;
-const SCREEN_HEIGHT: i32 = 1080;
-
-/// 全局共享状态，通过 axum 的 with_state 注入到各连接。
+/// 全局共享状态,通过 axum 的 with_state 注入到各连接。
 pub struct AppState {
     pub config: AppConfig,
     pub authenticator: Authenticator,
     pub guard: BruteForceGuard,
+    /// 视频帧 broadcast sender（M3）
+    pub video_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    /// 关键帧请求 sender（M3）
+    pub keyframe_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// 屏幕信息（M3）
+    pub screen_width: u32,
+    pub screen_height: u32,
 }
 
 /// 启动 HTTP 服务器：托管静态资源 + /ws WebSocket。
@@ -56,11 +60,24 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         config.security.auth_ban_seconds,
     );
 
+    // M3: 启动捕获编码管线
+    let (pipeline, screen_info) = CaptureEncoder::new(
+        config.video.fps,
+        config.video.bitrate,
+    )?;
+    let (video_tx, keyframe_tx) = pipeline.start(config.video.fps, 8);
+
+    info!("视频流已启动: {}x{}", screen_info.width, screen_info.height);
+
     let bind = config.bind.clone();
     let state = Arc::new(AppState {
         config,
         authenticator,
         guard,
+        video_tx,
+        keyframe_tx,
+        screen_width: screen_info.width,
+        screen_height: screen_info.height,
     });
 
     let app = Router::new()
@@ -118,32 +135,86 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
     let mut session: Option<Session> = None;
     // 输入注入器：认证成功后按需创建（避免未认证连接占用资源）。
     let mut injector: Option<Box<dyn InputInjector>> = None;
+    // 视频接收器：认证成功后创建
+    let mut video_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>> = None;
 
-    while let Some(frame) = socket.recv().await {
-        let msg = match frame {
-            Ok(Message::Text(text)) => match parse_client_msg(&text) {
-                Ok(m) => m,
-                Err(e) => {
-                    // 解析失败只记 warn，不断连。
-                    warn!("{}: 消息解析失败，已忽略: {}", peer_addr, e);
+    loop {
+        // M3: 认证后同时监听客户端消息和视频帧
+        let msg = if video_rx.is_some() {
+            tokio::select! {
+                frame_result = socket.recv() => {
+                    match frame_result {
+                        Some(Ok(Message::Text(text))) => match parse_client_msg(&text) {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                warn!("{}: 消息解析失败，已忽略: {}", peer_addr, e);
+                                continue;
+                            }
+                        },
+                        Some(Ok(Message::Close(_))) => {
+                            debug!("{}: 收到 Close 帧", peer_addr);
+                            break;
+                        }
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                        Some(Ok(Message::Binary(_))) => {
+                            debug!("{}: 收到二进制帧（暂不处理）", peer_addr);
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            warn!("{}: WebSocket 接收错误: {}", peer_addr, e);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                video_frame = video_rx.as_mut().unwrap().recv() => {
+                    match video_frame {
+                        Ok(frame) => {
+                            if let Err(e) = socket.send(Message::Binary(frame)).await {
+                                warn!("{}: 发送视频帧失败: {}", peer_addr, e);
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("{}: 视频接收滞后，跳过 {} 帧", peer_addr, n);
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!("{}: 视频接收错误: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            // 未认证：只监听客户端消息
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => match parse_client_msg(&text) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        warn!("{}: 消息解析失败，已忽略: {}", peer_addr, e);
+                        continue;
+                    }
+                },
+                Some(Ok(Message::Close(_))) => {
+                    debug!("{}: 收到 Close 帧", peer_addr);
+                    break;
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                Some(Ok(Message::Binary(_))) => {
+                    debug!("{}: 收到二进制帧（暂不处理）", peer_addr);
                     continue;
                 }
-            },
-            Ok(Message::Close(_)) => {
-                debug!("{}: 收到 Close 帧", peer_addr);
-                break;
-            }
-            // axum 会自动回应底层 Ping/Pong，这里无需处理。
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-            Ok(Message::Binary(_)) => {
-                debug!("{}: 收到二进制帧（M1 暂不处理）", peer_addr);
-                continue;
-            }
-            Err(e) => {
-                warn!("{}: WebSocket 接收错误: {}", peer_addr, e);
-                break;
+                Some(Err(e)) => {
+                    warn!("{}: WebSocket 接收错误: {}", peer_addr, e);
+                    break;
+                }
+                None => break,
             }
         };
+
+        let Some(msg) = msg else { continue };
 
         match &state_machine {
             AuthState::Unauthenticated => {
@@ -170,6 +241,8 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             let new_session = Session::new(peer_addr);
                             let session_id = new_session.id;
                             info!("{}: 认证成功，会话 {}", peer_addr, session_id);
+
+                            // 发送 auth_ok
                             if send_msg(
                                 &mut socket,
                                 &ServerMsg::AuthOk {
@@ -181,6 +254,28 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             {
                                 break;
                             }
+
+                            // M3: 发送屏幕信息
+                            if send_msg(
+                                &mut socket,
+                                &ServerMsg::ScreenInfo {
+                                    width: state.screen_width,
+                                    height: state.screen_height,
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+
+                            // M3: 订阅视频流
+                            video_rx = Some(state.video_tx.subscribe());
+                            info!("{}: 视频流已订阅", peer_addr);
+
+                            // 立即请求关键帧，确保新连接能收到 SPS/PPS/IDR。
+                            let _ = state.keyframe_tx.send(());
+
                             state_machine = AuthState::Authenticated { session_id };
                             session = Some(new_session);
                         } else {
@@ -253,14 +348,16 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                                 dx,
                                 dy,
                                 &code,
+                                state.screen_width as i32,
+                                state.screen_height as i32,
                             ) {
                                 warn!("{}: 注入输入事件 '{}' 失败: {}", peer_addr, event, e);
                             }
                         }
                     }
                     ClientMsg::Control { action } => {
-                        // 真正处理留给 M3。
-                        debug!("{}: 收到 control '{}'（M3 处理）", peer_addr, action);
+                        // 真正处理留给 M4。
+                        debug!("{}: 收到 control '{}'（M4 处理）", peer_addr, action);
                     }
                     ClientMsg::Auth { .. } => {
                         debug!("{}: 已认证连接重复发送 auth，忽略", peer_addr);
@@ -296,15 +393,17 @@ fn dispatch_input(
     dx: i32,
     dy: i32,
     code: &str,
+    screen_width: i32,
+    screen_height: i32,
 ) -> Result<()> {
     match event {
         "mouse_move" => {
-            let (px, py) = norm_to_pixel(x, y);
+            let (px, py) = norm_to_pixel(x, y, screen_width, screen_height);
             injector.move_mouse(px, py)
         }
         "mouse_down" | "mouse_up" => {
             let pressed = event == "mouse_down";
-            let (px, py) = norm_to_pixel(x, y);
+            let (px, py) = norm_to_pixel(x, y, screen_width, screen_height);
             // 点击前先挪到目标位置，确保 button down/up 在浏览器看到的位置发生。
             // 鼠标移动失败不应阻塞按键事件本身。
             if let Err(e) = injector.move_mouse(px, py) {
@@ -328,12 +427,12 @@ fn dispatch_input(
     }
 }
 
-/// 归一化 (0.0~1.0) → 屏幕像素坐标。M2 暂用硬编码 1920x1080，M3 起改真实值。
-fn norm_to_pixel(x: f64, y: f64) -> (i32, i32) {
+/// 归一化 (0.0~1.0) → 屏幕像素坐标。M3 使用真实屏幕分辨率。
+fn norm_to_pixel(x: f64, y: f64, screen_width: i32, screen_height: i32) -> (i32, i32) {
     let nx = x.clamp(0.0, 1.0);
     let ny = y.clamp(0.0, 1.0);
-    let px = (nx * f64::from(SCREEN_WIDTH)).round() as i32;
-    let py = (ny * f64::from(SCREEN_HEIGHT)).round() as i32;
+    let px = (nx * f64::from(screen_width)).round() as i32;
+    let py = (ny * f64::from(screen_height)).round() as i32;
     (px, py)
 }
 
@@ -343,10 +442,10 @@ mod tests {
 
     #[test]
     fn norm_to_pixel_clamps_and_rounds() {
-        assert_eq!(norm_to_pixel(0.0, 0.0), (0, 0));
-        assert_eq!(norm_to_pixel(1.0, 1.0), (1920, 1080));
-        assert_eq!(norm_to_pixel(0.5, 0.5), (960, 540));
+        assert_eq!(norm_to_pixel(0.0, 0.0, 1920, 1080), (0, 0));
+        assert_eq!(norm_to_pixel(1.0, 1.0, 1920, 1080), (1920, 1080));
+        assert_eq!(norm_to_pixel(0.5, 0.5, 1920, 1080), (960, 540));
         // 越界值被夹紧。
-        assert_eq!(norm_to_pixel(-0.5, 2.0), (0, 1080));
+        assert_eq!(norm_to_pixel(-0.5, 2.0, 1920, 1080), (0, 1080));
     }
 }

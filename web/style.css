@@ -140,3 +140,10 @@ h1 {
     pointer-events: none;
 }
 
+/* M3: 视频 canvas */
+#video-canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+}

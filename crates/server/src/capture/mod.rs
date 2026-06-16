@@ -28,7 +28,30 @@ pub trait ScreenCapturer: Send {
 
 /// 工厂函数：创建当前平台的捕获器实现
 pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
-    anyhow::bail!("屏幕捕获将在 M3 实现")
+    #[cfg(all(target_os = "linux", feature = "x11"))]
+    {
+        let capturer = x11::X11Capturer::new()?;
+        return Ok(Box::new(capturer));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        anyhow::bail!("Windows 屏幕捕获将在后续里程碑实现")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    {
+        anyhow::bail!("Wayland 屏幕捕获将在后续里程碑实现")
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "x11"),
+        target_os = "windows",
+        all(target_os = "linux", feature = "wayland")
+    )))]
+    {
+        anyhow::bail!("当前平台不支持屏幕捕获")
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "x11"))]

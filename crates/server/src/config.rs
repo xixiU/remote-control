@@ -47,7 +47,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8443".to_string(),
-            password: "change-me".to_string(),
+            password: "123456".to_string(),
             password_hash: None,
             video: VideoConfig::default(),
             security: SecurityConfig::default(),

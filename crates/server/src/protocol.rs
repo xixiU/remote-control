@@ -18,6 +18,8 @@ pub enum ServerMsg {
     },
     /// 认证成功，下发会话 ID。
     AuthOk { session_id: String },
+    /// 屏幕信息（M3：认证后发送）
+    ScreenInfo { width: u32, height: u32 },
     /// 认证失败，附带原因。
     AuthFail { reason: String },
     /// 通用错误。

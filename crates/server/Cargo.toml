@@ -37,3 +37,9 @@ thiserror = "1"
 
 # 输入注入
 enigo = "0.6.1"
+
+# 屏幕捕获（M3）- 纯 Rust X11 客户端，调用 XGetImage，无额外 C 库依赖
+x11rb = "0.13"
+
+# 视频编码（M3）
+openh264 = { version = "0.6", features = ["source"] }
