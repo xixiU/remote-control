@@ -1,0 +1,13 @@
+# Rust 编译产物
+/target
+**/*.rs.bk
+
+# 运行时生成的配置/证书（如自签名证书缓存）
+/config.toml
+*.pem
+
+# 编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
