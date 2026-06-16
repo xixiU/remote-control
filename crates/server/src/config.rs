@@ -9,8 +9,10 @@ use tracing::warn;
 pub struct AppConfig {
     /// 监听地址
     pub bind: String,
-    /// 访问密码
+    /// 访问密码（明文）。若同时提供 password_hash，则以 password_hash 优先。
     pub password: String,
+    /// 访问密码的 argon2 哈希（PHC 格式）。配置直接给哈希时使用，优先于明文 password。
+    pub password_hash: Option<String>,
     /// 视频配置
     pub video: VideoConfig,
     /// 安全配置
@@ -46,6 +48,7 @@ impl Default for AppConfig {
         Self {
             bind: "0.0.0.0:8443".to_string(),
             password: "change-me".to_string(),
+            password_hash: None,
             video: VideoConfig::default(),
             security: SecurityConfig::default(),
         }

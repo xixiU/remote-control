@@ -9,9 +9,19 @@
 <body>
     <div class="container">
         <h1>RemoteControl</h1>
-        <p class="status">远程桌面控制服务已就绪</p>
+        <p class="status" id="status">未连接</p>
         <div class="info">
-            <p>被控端服务正在运行。后续版本将在此页面展示远程桌面画面。</p>
+            <form id="auth-form" class="auth-form">
+                <input
+                    type="password"
+                    id="password"
+                    class="field"
+                    placeholder="请输入访问密码"
+                    autocomplete="current-password"
+                />
+                <button type="submit" id="connect-btn" class="btn">连接</button>
+            </form>
+            <p class="hint" id="hint">输入密码后点击连接，验证 M1 认证流程。</p>
         </div>
     </div>
     <script src="app.js"></script>
