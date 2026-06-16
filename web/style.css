@@ -107,3 +107,36 @@ h1 {
     font-size: 0.9rem;
     word-break: break-all;
 }
+
+/* M2 输入采集区 */
+.control-panel {
+    margin-top: 1.5rem;
+    max-width: 800px;
+}
+
+.control-surface {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #0d0d1a;
+    border: 1px solid rgba(0, 212, 255, 0.4);
+    border-radius: 8px;
+    cursor: crosshair;
+    user-select: none;
+    outline: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.control-surface:focus {
+    border-color: #00d4ff;
+    box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.25);
+}
+
+.surface-label {
+    color: #555;
+    font-size: 0.95rem;
+    pointer-events: none;
+}
+

@@ -34,3 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 错误处理
 anyhow = "1"
 thiserror = "1"
+
+# 输入注入
+enigo = "0.6.1"

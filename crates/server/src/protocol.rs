@@ -42,11 +42,32 @@ pub enum ClientMsg {
         #[serde(default)]
         action: String,
     },
-    /// 输入事件（鼠标/键盘）。M1 暂不处理，留给 M2。
+    /// 输入事件（鼠标/键盘）。M2 完整解析。
     Input {
-        /// 事件子类型，宽松解析。
+        /// 事件子类型：mouse_move/mouse_down/mouse_up/wheel/key_down/key_up。
         #[serde(default)]
         event: String,
+        /// 归一化 x 坐标 (0.0~1.0)，用于鼠标事件。
+        #[serde(default)]
+        x: f64,
+        /// 归一化 y 坐标 (0.0~1.0)，用于鼠标事件。
+        #[serde(default)]
+        y: f64,
+        /// 鼠标按键："left"/"right"/"middle"。
+        #[serde(default)]
+        button: String,
+        /// 滚轮横向增量。
+        #[serde(default)]
+        dx: i32,
+        /// 滚轮纵向增量。
+        #[serde(default)]
+        dy: i32,
+        /// 键盘按键码（KeyboardEvent.code，如 "KeyA"）。
+        #[serde(default)]
+        code: String,
+        /// 修饰键列表（"shift"/"ctrl"/"alt"/"meta"）。
+        #[serde(default)]
+        modifiers: Vec<String>,
     },
     /// 心跳。
     Ping,
@@ -140,7 +161,14 @@ mod tests {
         assert_eq!(
             input,
             ClientMsg::Input {
-                event: "mouse_move".to_string()
+                event: "mouse_move".to_string(),
+                x: 0.5,
+                y: 0.5,
+                button: String::new(),
+                dx: 0,
+                dy: 0,
+                code: String::new(),
+                modifiers: Vec::new(),
             }
         );
 
@@ -152,6 +180,64 @@ mod tests {
                 action: "request_keyframe".to_string()
             }
         );
+    }
+
+    #[test]
+    fn input_mouse_down_parses_button() {
+        let msg = parse_client_msg(
+            r#"{"type":"input","event":"mouse_down","button":"right","x":0.1,"y":0.2}"#,
+        )
+        .unwrap();
+        match msg {
+            ClientMsg::Input {
+                event,
+                button,
+                x,
+                y,
+                ..
+            } => {
+                assert_eq!(event, "mouse_down");
+                assert_eq!(button, "right");
+                assert!((x - 0.1).abs() < 1e-9);
+                assert!((y - 0.2).abs() < 1e-9);
+            }
+            _ => panic!("应解析为 Input"),
+        }
+    }
+
+    #[test]
+    fn input_wheel_parses_deltas() {
+        let msg = parse_client_msg(r#"{"type":"input","event":"wheel","dx":0,"dy":-120}"#)
+            .unwrap();
+        match msg {
+            ClientMsg::Input { event, dx, dy, .. } => {
+                assert_eq!(event, "wheel");
+                assert_eq!(dx, 0);
+                assert_eq!(dy, -120);
+            }
+            _ => panic!("应解析为 Input"),
+        }
+    }
+
+    #[test]
+    fn input_key_event_parses_code_and_modifiers() {
+        let msg = parse_client_msg(
+            r#"{"type":"input","event":"key_down","code":"KeyA","modifiers":["shift","ctrl"]}"#,
+        )
+        .unwrap();
+        match msg {
+            ClientMsg::Input {
+                event,
+                code,
+                modifiers,
+                ..
+            } => {
+                assert_eq!(event, "key_down");
+                assert_eq!(code, "KeyA");
+                assert_eq!(modifiers, vec!["shift".to_string(), "ctrl".to_string()]);
+            }
+            _ => panic!("应解析为 Input"),
+        }
     }
 
     #[test]

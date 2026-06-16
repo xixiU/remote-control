@@ -16,11 +16,16 @@ use tower_http::services::ServeDir;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
+use crate::input::{self, InputInjector, MouseButton};
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
 use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
+
+/// M2 临时硬编码屏幕分辨率：M3 屏幕捕获就位后改用真实分辨率。
+const SCREEN_WIDTH: i32 = 1920;
+const SCREEN_HEIGHT: i32 = 1080;
 
 /// 全局共享状态，通过 axum 的 with_state 注入到各连接。
 pub struct AppState {
@@ -111,6 +116,8 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
     // 2. 未认证状态循环：只接受 auth / ping。
     let mut state_machine = AuthState::Unauthenticated;
     let mut session: Option<Session> = None;
+    // 输入注入器：认证成功后按需创建（避免未认证连接占用资源）。
+    let mut injector: Option<Box<dyn InputInjector>> = None;
 
     while let Some(frame) = socket.recv().await {
         let msg = match frame {
@@ -207,9 +214,49 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                     ClientMsg::Ping => {
                         let _ = send_msg(&mut socket, &ServerMsg::Pong).await;
                     }
-                    ClientMsg::Input { event } => {
-                        // 真正处理留给 M2。
-                        debug!("{}: 收到 input 事件 '{}'（M2 处理）", peer_addr, event);
+                    ClientMsg::Input {
+                        event,
+                        x,
+                        y,
+                        button,
+                        dx,
+                        dy,
+                        code,
+                        modifiers: _,
+                    } => {
+                        // 首次输入事件时延迟初始化注入器：失败只 warn，不断连，
+                        // 但后续事件就直接跳过（避免每事件重试日志风暴）。
+                        if injector.is_none() {
+                            match input::create_injector() {
+                                Ok(inj) => {
+                                    info!("{}: 输入注入器已就绪", peer_addr);
+                                    injector = Some(inj);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "{}: 创建输入注入器失败，本会话将丢弃所有输入: {}",
+                                        peer_addr, e
+                                    );
+                                    // 用兜底标记防止反复重试：下一节用 None 跳过。
+                                    // 这里继续 break match，等下一条消息。
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(inj) = injector.as_mut() {
+                            if let Err(e) = dispatch_input(
+                                inj.as_mut(),
+                                &event,
+                                x,
+                                y,
+                                &button,
+                                dx,
+                                dy,
+                                &code,
+                            ) {
+                                warn!("{}: 注入输入事件 '{}' 失败: {}", peer_addr, event, e);
+                            }
+                        }
                     }
                     ClientMsg::Control { action } => {
                         // 真正处理留给 M3。
@@ -234,4 +281,72 @@ async fn send_msg(socket: &mut WebSocket, msg: &ServerMsg) -> Result<()> {
     let text = msg.to_json()?;
     socket.send(Message::Text(text)).await?;
     Ok(())
+}
+
+/// 把协议层 input 事件分派到注入器。
+///
+/// `event` 决定走哪条路径，多余字段被忽略。坐标 `x`/`y` 是归一化的 0.0~1.0，
+/// 在这里换算成像素坐标。
+fn dispatch_input(
+    injector: &mut dyn InputInjector,
+    event: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    dx: i32,
+    dy: i32,
+    code: &str,
+) -> Result<()> {
+    match event {
+        "mouse_move" => {
+            let (px, py) = norm_to_pixel(x, y);
+            injector.move_mouse(px, py)
+        }
+        "mouse_down" | "mouse_up" => {
+            let pressed = event == "mouse_down";
+            let (px, py) = norm_to_pixel(x, y);
+            // 点击前先挪到目标位置，确保 button down/up 在浏览器看到的位置发生。
+            // 鼠标移动失败不应阻塞按键事件本身。
+            if let Err(e) = injector.move_mouse(px, py) {
+                debug!("点击前 move_mouse 失败（忽略，继续按键）: {}", e);
+            }
+            let Some(btn) = MouseButton::from_str(button) else {
+                debug!("未支持的鼠标按键 '{}'，忽略事件", button);
+                return Ok(());
+            };
+            injector.mouse_button(btn, pressed)
+        }
+        "wheel" => injector.scroll(dx, dy),
+        "key_down" | "key_up" => {
+            let pressed = event == "key_down";
+            injector.key(code, pressed)
+        }
+        other => {
+            debug!("未支持的 input 事件 '{}'，忽略", other);
+            Ok(())
+        }
+    }
+}
+
+/// 归一化 (0.0~1.0) → 屏幕像素坐标。M2 暂用硬编码 1920x1080，M3 起改真实值。
+fn norm_to_pixel(x: f64, y: f64) -> (i32, i32) {
+    let nx = x.clamp(0.0, 1.0);
+    let ny = y.clamp(0.0, 1.0);
+    let px = (nx * f64::from(SCREEN_WIDTH)).round() as i32;
+    let py = (ny * f64::from(SCREEN_HEIGHT)).round() as i32;
+    (px, py)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norm_to_pixel_clamps_and_rounds() {
+        assert_eq!(norm_to_pixel(0.0, 0.0), (0, 0));
+        assert_eq!(norm_to_pixel(1.0, 1.0), (1920, 1080));
+        assert_eq!(norm_to_pixel(0.5, 0.5), (960, 540));
+        // 越界值被夹紧。
+        assert_eq!(norm_to_pixel(-0.5, 2.0), (0, 1080));
+    }
 }

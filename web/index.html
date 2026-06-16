@@ -10,7 +10,7 @@
     <div class="container">
         <h1>RemoteControl</h1>
         <p class="status" id="status">未连接</p>
-        <div class="info">
+        <div class="info" id="auth-panel">
             <form id="auth-form" class="auth-form">
                 <input
                     type="password"
@@ -22,6 +22,19 @@
                 <button type="submit" id="connect-btn" class="btn">连接</button>
             </form>
             <p class="hint" id="hint">输入密码后点击连接，验证 M1 认证流程。</p>
+        </div>
+
+        <!-- M2：认证后显示的输入采集区。M3 起此处会绘制视频画面。 -->
+        <div class="control-panel" id="control-panel" hidden>
+            <div
+                id="control-surface"
+                class="control-surface"
+                tabindex="0"
+                aria-label="远程控制输入区域：在此移动/点击鼠标、按键将注入到被控端"
+            >
+                <span class="surface-label">点此聚焦后即可发送鼠标/键盘事件</span>
+            </div>
+            <p class="hint" id="control-hint">认证后即可发送输入。鼠标坐标按 1920x1080 换算。</p>
         </div>
     </div>
     <script src="app.js"></script>
