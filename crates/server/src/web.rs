@@ -70,6 +70,8 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
     info!("视频流已启动: {}x{}", screen_info.width, screen_info.height);
 
     let bind = config.bind.clone();
+    let tls_enabled = config.tls.enabled;
+    let tls_config = config.tls.clone();
     let state = Arc::new(AppState {
         config,
         authenticator,
@@ -85,9 +87,6 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         .fallback_service(ServeDir::new(&web_dir))
         .with_state(state);
 
-    let listener = TcpListener::bind(&bind).await?;
-    info!("HTTP 服务已启动: http://{}", bind);
-
     // 监听 0.0.0.0 时打印安全提示（见 docs/04 第 6 节）。
     if bind.starts_with("0.0.0.0") {
         warn!(
@@ -95,12 +94,26 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         );
     }
 
-    // 需要 ConnectInfo 拿到客户端 IP，故用 into_make_service_with_connect_info。
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    // M4: 根据 TLS 配置决定启动 HTTPS 还是 HTTP
+    if tls_enabled {
+        let rustls_config = crate::tls::make_rustls_config(&tls_config)?;
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
+        let addr: SocketAddr = bind.parse()?;
+        info!("HTTPS 服务已启动: https://{}", bind);
+
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    } else {
+        let listener = TcpListener::bind(&bind).await?;
+        info!("HTTP 服务已启动: http://{}（TLS 未启用，仅限开发环境）", bind);
+
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -356,8 +369,12 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                         }
                     }
                     ClientMsg::Control { action } => {
-                        // 真正处理留给 M4。
-                        debug!("{}: 收到 control '{}'（M4 处理）", peer_addr, action);
+                        if action == "request_keyframe" {
+                            debug!("{}: 收到关键帧请求", peer_addr);
+                            let _ = state.keyframe_tx.send(());
+                        } else {
+                            debug!("{}: 收到未知 control '{}'，忽略", peer_addr, action);
+                        }
                     }
                     ClientMsg::Auth { .. } => {
                         debug!("{}: 已认证连接重复发送 auth，忽略", peer_addr);

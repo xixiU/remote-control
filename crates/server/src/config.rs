@@ -17,6 +17,30 @@ pub struct AppConfig {
     pub video: VideoConfig,
     /// 安全配置
     pub security: SecurityConfig,
+    /// TLS 配置
+    pub tls: TlsConfig,
+}
+
+/// TLS 配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// 是否启用 TLS（默认 true）
+    pub enabled: bool,
+    /// 证书文件路径（留空则自动生成自签名证书）
+    pub cert: Option<String>,
+    /// 私钥文件路径
+    pub key: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cert: None,
+            key: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +75,7 @@ impl Default for AppConfig {
             password_hash: None,
             video: VideoConfig::default(),
             security: SecurityConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }

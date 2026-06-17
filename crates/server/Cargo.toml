@@ -43,3 +43,11 @@ x11rb = "0.13"
 
 # 视频编码（M3）
 openh264 = { version = "0.6", features = ["source"] }
+
+# TLS（M4）— 统一使用 ring 后端，避免 aws-lc-sys 的 C 编译/链接负担。
+# axum-server 用 tls-rustls-no-provider，避免它强制开启 rustls/aws-lc-rs。
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

@@ -143,6 +143,12 @@ function sendInput(payload) {
     ws.send(JSON.stringify({ type: 'input', ...payload }));
 }
 
+// M4: 请求服务端尽快下发一个关键帧（用于切回标签页等画面恢复场景）。
+function requestKeyframe() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'control', action: 'request_keyframe' }));
+}
+
 // 把控制区内的鼠标坐标换算成 0~1 归一化值，按 docs/03 第 3.1 节约定。
 function normalizedFromMouse(ev) {
     const rect = surfaceEl.getBoundingClientRect();
@@ -269,6 +275,13 @@ formEl.addEventListener('submit', (ev) => {
         sendAuth();
     } else {
         connect();
+    }
+});
+
+// M4: 标签页重新可见时，浏览器可能已丢弃若干帧，主动请求关键帧尽快恢复画面。
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        requestKeyframe();
     }
 });
 
