@@ -117,6 +117,7 @@ h1 {
 .control-surface {
     position: relative;
     width: 100%;
+    /* 初始占位比例；连接后由 JS 按被控端真实屏幕比例覆盖（见 app.js screen_info）。 */
     aspect-ratio: 16 / 9;
     background: #0d0d1a;
     border: 1px solid rgba(0, 212, 255, 0.4);

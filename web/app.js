@@ -108,6 +108,9 @@ function handleMessage(msg) {
             screenHeight = msg.height;
             canvasEl.width = screenWidth;
             canvasEl.height = screenHeight;
+            // M4: 让控制区比例与被控端屏幕一致，消除 object-fit:contain 的黑边。
+            // 屏幕未必是 16:9（如 1920x972），比例不符会让鼠标坐标归一化偏移。
+            surfaceEl.style.aspectRatio = `${screenWidth} / ${screenHeight}`;
             initVideoDecoder();
             break;
         case 'auth_ok':
@@ -150,8 +153,9 @@ function requestKeyframe() {
 }
 
 // 把控制区内的鼠标坐标换算成 0~1 归一化值，按 docs/03 第 3.1 节约定。
+// M4: 基于 canvas 实际显示矩形换算（而非 surface div），避免边框/留边导致偏移。
 function normalizedFromMouse(ev) {
-    const rect = surfaceEl.getBoundingClientRect();
+    const rect = canvasEl.getBoundingClientRect();
     const x = (ev.clientX - rect.left) / rect.width;
     const y = (ev.clientY - rect.top) / rect.height;
     return {
