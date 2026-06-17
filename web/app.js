@@ -180,10 +180,33 @@ function requestKeyframe() {
 
 // 把控制区内的鼠标坐标换算成 0~1 归一化值，按 docs/03 第 3.1 节约定。
 // M4: 基于 canvas 实际显示矩形换算（而非 surface div），避免边框/留边导致偏移。
+// M5: canvas 上有 object-fit:contain，元素盒子比例与画面比例不一致时（如浏览器
+//     全屏，视口非 16:9），画面会被居中缩放、四周留黑边。getBoundingClientRect()
+//     返回的是含黑边的元素盒子，直接除会偏移。这里按画面内在比例算出真正绘制的
+//     内容矩形，扣掉黑边再归一化。
 function normalizedFromMouse(ev) {
     const rect = canvasEl.getBoundingClientRect();
-    const x = (ev.clientX - rect.left) / rect.width;
-    const y = (ev.clientY - rect.top) / rect.height;
+
+    // 元素盒子与画面（内在尺寸）的宽高比。
+    const boxAspect = rect.width / rect.height;
+    const contentAspect = screenWidth / screenHeight;
+
+    // object-fit:contain：取能放进盒子的最大等比矩形，居中放置。
+    let contentW = rect.width;
+    let contentH = rect.height;
+    if (boxAspect > contentAspect) {
+        // 盒子比画面更宽 → 左右留黑边（pillarbox）。
+        contentW = rect.height * contentAspect;
+    } else if (boxAspect < contentAspect) {
+        // 盒子比画面更高 → 上下留黑边（letterbox）。
+        contentH = rect.width / contentAspect;
+    }
+    // 黑边偏移：内容在盒子内居中。
+    const offsetX = (rect.width - contentW) / 2;
+    const offsetY = (rect.height - contentH) / 2;
+
+    const x = (ev.clientX - rect.left - offsetX) / contentW;
+    const y = (ev.clientY - rect.top - offsetY) / contentH;
     return {
         x: Math.min(1, Math.max(0, x)),
         y: Math.min(1, Math.max(0, y)),
