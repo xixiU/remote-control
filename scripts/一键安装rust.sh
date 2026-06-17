@@ -52,6 +52,17 @@ done
 
 # ---------- 0. 已安装检测 ----------
 title "检测当前 Rust 环境"
+
+# 拦截 sudo 误用：sudo 下 $HOME 会变为 /root，rust 装进 /root/.cargo，
+# 普通用户退出 sudo 后在自己的 $HOME 下找不到 .cargo/env（最常见的报错原因）。
+if [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
+    err "检测到通过 sudo 运行本脚本。"
+    warn "请勿加 sudo —— 这会把 Rust 安装到 root 用户目录(/root/.cargo)，"
+    warn "导致普通用户 $SUDO_USER 下找不到 \$HOME/.cargo/env。"
+    warn "正确用法：bash $0   （脚本在需要装系统依赖时会自行调用 sudo）"
+    exit 1
+fi
+
 if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
     ok "rustc:  $(rustc --version)"
     ok "cargo:  $(cargo --version)"
@@ -113,15 +124,37 @@ fi
 ok "已下载到 $TMP_INSTALLER"
 
 title "执行 rustup 安装 (toolchain=$TOOLCHAIN, profile=$PROFILE)"
-sh "$TMP_INSTALLER" -y \
+if ! sh "$TMP_INSTALLER" -y \
     --default-toolchain "$TOOLCHAIN" \
     --profile "$PROFILE" \
-    --no-modify-path
-ok "rustup 安装完成"
+    --no-modify-path; then
+    err "rustup 安装器执行失败"
+    if [[ "$USE_MIRROR" -eq 1 ]]; then
+        warn "可能是国内镜像不稳定，可重试: bash $0 --no-mirror"
+    fi
+    exit 1
+fi
+ok "rustup 安装器执行完成"
 
 # ---------- 4. 加载环境 ----------
+# rustup 默认把 env 写到 $CARGO_HOME/env（CARGO_HOME 默认 $HOME/.cargo）。
+# 这里显式按 CARGO_HOME 定位，避免设置了 CARGO_HOME 或 sudo 导致路径不符。
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+CARGO_ENV_FILE="$CARGO_HOME_DIR/env"
+
+if [[ ! -f "$CARGO_ENV_FILE" ]]; then
+    err "未找到 $CARGO_ENV_FILE，说明 rustup 没有成功安装到预期目录。"
+    warn "常见原因与排查："
+    warn "  1) 是否用 sudo 运行了本脚本？请勿加 sudo（脚本内部装依赖时会自行调用 sudo）。"
+    warn "     sudo 会把 \$HOME 变为 /root，rust 装进 /root/.cargo，普通用户下自然找不到。"
+    warn "  2) 是否设置了 CARGO_HOME 指向其它目录？当前 CARGO_HOME=${CARGO_HOME:-未设置}"
+    warn "  3) 检查实际安装位置：ls -la \$HOME/.cargo/  以及  ls -la /root/.cargo/"
+    exit 1
+fi
+
 # shellcheck disable=SC1090
-source "$HOME/.cargo/env"
+source "$CARGO_ENV_FILE"
+ok "已加载 $CARGO_ENV_FILE"
 
 # ---------- 5. 配置 cargo 镜像源 ----------
 if [[ "$USE_MIRROR" -eq 1 ]]; then
