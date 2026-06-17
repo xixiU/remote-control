@@ -21,6 +21,7 @@ use crate::pipeline::CaptureEncoder;
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
 use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
 use crate::clipboard;
+use crate::capture::ScreenInfo;
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
@@ -34,9 +35,10 @@ pub struct AppState {
     pub video_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     /// 关键帧请求 sender（M3）
     pub keyframe_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    /// 屏幕信息（M3）
-    pub screen_width: u32,
-    pub screen_height: u32,
+    /// 屏幕信息变化 broadcast sender
+    pub screen_info_tx: tokio::sync::broadcast::Sender<crate::capture::ScreenInfo>,
+    /// 屏幕信息（M3）- 使用 Arc<RwLock> 支持动态更新
+    pub screen_info: Arc<tokio::sync::RwLock<crate::capture::ScreenInfo>>,
 }
 
 /// 启动 HTTP 服务器：托管静态资源 + /ws WebSocket。
@@ -66,21 +68,46 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         config.video.fps,
         config.video.bitrate,
     )?;
-    let (video_tx, keyframe_tx) = pipeline.start(config.video.fps, 8);
+    let (video_tx, keyframe_tx, mut screen_info_rx) = pipeline.start(
+        config.video.fps,
+        config.video.bitrate,
+        8,
+    );
 
     info!("视频流已启动: {}x{}", screen_info.width, screen_info.height);
 
     let bind = config.bind.clone();
     let tls_enabled = config.tls.enabled;
     let tls_config = config.tls.clone();
+
+    // 创建屏幕信息变化广播 channel
+    let (screen_info_tx, _) = tokio::sync::broadcast::channel(16);
+    let screen_info_tx_clone = screen_info_tx.clone();
+    let screen_info_arc = Arc::new(tokio::sync::RwLock::new(screen_info.clone()));
+    let screen_info_arc_clone = screen_info_arc.clone();
+
+    // 启动屏幕信息变化监听任务
+    tokio::spawn(async move {
+        while let Some(new_info) = screen_info_rx.recv().await {
+            info!(
+                "屏幕分辨率已更新: {}x{}，通知所有客户端",
+                new_info.width, new_info.height
+            );
+            // 更新共享的屏幕信息
+            *screen_info_arc_clone.write().await = new_info.clone();
+            // 广播给所有已连接的客户端
+            let _ = screen_info_tx_clone.send(new_info);
+        }
+    });
+
     let state = Arc::new(AppState {
         config,
         authenticator,
         guard,
         video_tx,
         keyframe_tx,
-        screen_width: screen_info.width,
-        screen_height: screen_info.height,
+        screen_info_tx,
+        screen_info: screen_info_arc,
     });
 
     let app = Router::new()
@@ -151,9 +178,11 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
     let mut injector: Option<Box<dyn InputInjector>> = None;
     // 视频接收器：认证成功后创建
     let mut video_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>> = None;
+    // 屏幕信息变化接收器：认证成功后创建
+    let mut screen_info_change_rx: Option<tokio::sync::broadcast::Receiver<ScreenInfo>> = None;
 
     loop {
-        // M3: 认证后同时监听客户端消息和视频帧
+        // M3: 认证后同时监听客户端消息、视频帧和屏幕信息变化
         let msg = if video_rx.is_some() {
             tokio::select! {
                 frame_result = socket.recv() => {
@@ -197,6 +226,39 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                         Err(e) => {
                             warn!("{}: 视频接收错误: {}", peer_addr, e);
                             break;
+                        }
+                    }
+                }
+                screen_info_change = async {
+                    match screen_info_change_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match screen_info_change {
+                        Ok(new_info) => {
+                            info!("{}: 推送屏幕分辨率变化: {}x{}", peer_addr, new_info.width, new_info.height);
+                            if let Err(e) = send_msg(
+                                &mut socket,
+                                &ServerMsg::ScreenInfo {
+                                    width: new_info.width,
+                                    height: new_info.height,
+                                },
+                            ).await {
+                                warn!("{}: 发送屏幕信息变化失败: {}", peer_addr, e);
+                                break;
+                            }
+                            // 请求关键帧，确保客户端能立即看到新分辨率的画面
+                            let _ = state.keyframe_tx.send(());
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // 滞后时可以忽略，因为最新的 screen_info 会在下次更新时收到
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("{}: 屏幕信息变化接收错误: {}", peer_addr, e);
+                            continue;
                         }
                     }
                 }
@@ -270,11 +332,12 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             }
 
                             // M3: 发送屏幕信息
+                            let current_screen_info = state.screen_info.read().await;
                             if send_msg(
                                 &mut socket,
                                 &ServerMsg::ScreenInfo {
-                                    width: state.screen_width,
-                                    height: state.screen_height,
+                                    width: current_screen_info.width,
+                                    height: current_screen_info.height,
                                 },
                             )
                             .await
@@ -282,10 +345,15 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             {
                                 break;
                             }
+                            drop(current_screen_info);
 
                             // M3: 订阅视频流
                             video_rx = Some(state.video_tx.subscribe());
                             info!("{}: 视频流已订阅", peer_addr);
+
+                            // 订阅屏幕信息变化
+                            screen_info_change_rx = Some(state.screen_info_tx.subscribe());
+                            debug!("{}: 屏幕信息变化已订阅", peer_addr);
 
                             // 立即请求关键帧，确保新连接能收到 SPS/PPS/IDR。
                             let _ = state.keyframe_tx.send(());
@@ -353,6 +421,7 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             }
                         }
                         if let Some(inj) = injector.as_mut() {
+                            let screen_info = state.screen_info.read().await;
                             if let Err(e) = dispatch_input(
                                 inj.as_mut(),
                                 &event,
@@ -362,8 +431,8 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                                 dx,
                                 dy,
                                 &code,
-                                state.screen_width as i32,
-                                state.screen_height as i32,
+                                screen_info.width as i32,
+                                screen_info.height as i32,
                             ) {
                                 warn!("{}: 注入输入事件 '{}' 失败: {}", peer_addr, event, e);
                             }

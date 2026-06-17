@@ -104,4 +104,29 @@ impl ScreenCapturer for X11Capturer {
             data,
         })
     }
+
+    fn refresh_info(&mut self) -> Result<bool> {
+        // 重新查询根窗口的几何信息以检测分辨率变化
+        let geom = self
+            .conn
+            .get_geometry(self.root)
+            .context("查询根窗口几何信息失败")?
+            .reply()
+            .context("接收几何信息回复失败")?;
+
+        let new_width = geom.width as u32;
+        let new_height = geom.height as u32;
+
+        if new_width != self.info.width || new_height != self.info.height {
+            info!(
+                "检测到屏幕分辨率变化: {}x{} → {}x{}",
+                self.info.width, self.info.height, new_width, new_height
+            );
+            self.info.width = new_width;
+            self.info.height = new_height;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }

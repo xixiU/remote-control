@@ -24,6 +24,8 @@ pub trait ScreenCapturer: Send {
     fn info(&self) -> ScreenInfo;
     /// 抓取一帧，返回原始像素（BGRA）
     fn grab_frame(&mut self) -> Result<Frame>;
+    /// 检测并更新屏幕分辨率。返回 Ok(true) 表示分辨率已变化。
+    fn refresh_info(&mut self) -> Result<bool>;
 }
 
 /// 工厂函数：创建当前平台的捕获器实现
