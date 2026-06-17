@@ -62,17 +62,29 @@ fi
 mkdir -p "$AUTOSTART_DIR"
 
 # Exec 用 bash -lc 加载登录环境（PATH 等），并显式等待 X 就绪。
+#
+# 注意：XDG Desktop Entry 规范规定 Exec 值里 ';' 和单引号 ' 是保留字符，
+# 必须置于双引号内。早期版本用单引号包裹 `'sleep 5; ...'`，会被严格的
+# 会话管理器（如 UKUI/MATE）判为非法 Exec 而拒绝执行，导致开机不自启。
+# 这里统一用双引号包裹整条命令，内部脚本路径再用转义双引号 \" 括起。
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=RemoteControl Server
 Comment=远程控制被控端服务（登录后自动启动）
-Exec=bash -lc 'sleep 5; "$START_SCRIPT"'
+Exec=bash -lc "sleep 5; exec \\"$START_SCRIPT\\""
 Path=$PROJECT_DIR
 Terminal=false
 X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Delay=5
 EOF
+
+# 安装后立即校验生成的 desktop 文件是否合规（有 desktop-file-validate 时）
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    if ! desktop-file-validate "$DESKTOP_FILE" >/dev/null 2>&1; then
+        echo "⚠ 警告: 生成的自启文件未通过 desktop-file-validate 校验，部分桌面环境可能不执行。"
+    fi
+fi
 
 chmod +x "$DESKTOP_FILE" 2>/dev/null || true
 
