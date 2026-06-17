@@ -229,12 +229,14 @@ if [[ ! -f "$PKG_DIR/config.toml" ]]; then
 fi
 
 mkdir -p "$AUTOSTART_DIR"
+# Exec 内禁用单引号包裹含 ';' 的命令：UKUI/MATE 会判为非法 Exec 而拒绝执行。
+# 统一用双引号包裹整条命令，脚本路径再用转义双引号 \" 括起。
 cat > "$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=RemoteControl Server
 Comment=远程控制被控端服务（登录后自动启动）
-Exec=bash -lc 'sleep 5; "$START_SCRIPT"'
+Exec=bash -lc "sleep 5; exec \\"$START_SCRIPT\\""
 Path=$PKG_DIR
 Terminal=false
 X-GNOME-Autostart-enabled=true
