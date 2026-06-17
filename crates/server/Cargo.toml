@@ -41,6 +41,10 @@ enigo = "0.6.1"
 # 屏幕捕获（M3）- 纯 Rust X11 客户端，调用 XGetImage，无额外 C 库依赖
 x11rb = "0.13"
 
+# 系统剪切板：Linux 默认走 x11rb 后端，与本项目已有依赖一致；
+# 关闭 wayland-data-control 默认特性，避免引入额外系统依赖（Wayland 支持后再开）。
+arboard = { version = "3", default-features = false }
+
 # 视频编码（M3）
 openh264 = { version = "0.6", features = ["source"] }
 

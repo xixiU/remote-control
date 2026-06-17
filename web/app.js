@@ -143,6 +143,18 @@ function handleMessage(msg) {
             setStatus('服务端错误', 'fail');
             hintEl.textContent = `${msg.code}: ${msg.message}`;
             break;
+        case 'clipboard_data':
+            // 远端剪切板内容到达，写入本地浏览器剪切板。
+            applyRemoteClipboard(msg.text || '');
+            break;
+        case 'clipboard_error':
+            console.warn('剪切板操作失败:', msg.op, msg.message);
+            if (msg.op === 'get') {
+                flashButton(btnReadClipboardEl, '远端失败');
+            } else if (msg.op === 'set') {
+                flashButton(btnSendClipboardEl, '远端失败');
+            }
+            break;
         case 'pong':
             break;
         default:
@@ -527,11 +539,63 @@ document.addEventListener('fullscreenchange', () => {
 });
 
 btnSendClipboardEl.addEventListener('click', () => {
-    // TODO: 实现本地剪切板传输到被控端
-    console.log('[drawer] 传输本地剪切板（功能未实现）');
+    sendLocalClipboard();
 });
 
 btnReadClipboardEl.addEventListener('click', () => {
-    // TODO: 实现读取被控端剪切板
-    console.log('[drawer] 读取远端剪切板（功能未实现）');
+    readRemoteClipboard();
 });
+
+/// 短暂改按钮文案做反馈，到时恢复原文案。
+function flashButton(btn, text, ms = 1500) {
+    if (btn._restoreTimer) {
+        clearTimeout(btn._restoreTimer);
+    } else {
+        btn._origText = btn.textContent;
+    }
+    btn.textContent = text;
+    btn._restoreTimer = setTimeout(() => {
+        btn.textContent = btn._origText;
+        btn._restoreTimer = null;
+    }, ms);
+}
+
+/// 传输本地剪切板：读浏览器剪切板文本，发给服务端写入被控端。
+async function sendLocalClipboard() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!navigator.clipboard || !navigator.clipboard.readText) {
+        flashButton(btnSendClipboardEl, '浏览器不支持');
+        return;
+    }
+    try {
+        const text = await navigator.clipboard.readText();
+        ws.send(JSON.stringify({ type: 'clipboard_set', text }));
+        flashButton(btnSendClipboardEl, '已发送 ✓');
+    } catch (e) {
+        // 读取被拒（未授权或非安全上下文）或其他异常。
+        console.warn('读取本地剪切板失败:', e);
+        flashButton(btnSendClipboardEl, '读取被拒');
+    }
+}
+
+/// 读取远端剪切板：向服务端请求，收到 clipboard_data 后写入浏览器剪切板。
+function readRemoteClipboard() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'clipboard_get' }));
+    flashButton(btnReadClipboardEl, '读取中…');
+}
+
+/// 收到远端剪切板内容后写入本地浏览器剪切板。
+async function applyRemoteClipboard(text) {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        flashButton(btnReadClipboardEl, '浏览器不支持');
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(text);
+        flashButton(btnReadClipboardEl, '已写入本地 ✓');
+    } catch (e) {
+        console.warn('写入本地剪切板失败:', e);
+        flashButton(btnReadClipboardEl, '写入被拒');
+    }
+}

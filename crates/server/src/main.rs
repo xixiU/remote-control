@@ -7,6 +7,7 @@ mod capture;
 mod encoder;
 mod input;
 mod pipeline;
+mod clipboard;
 
 use anyhow::Result;
 use clap::Parser;

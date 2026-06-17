@@ -19,6 +19,27 @@ pub struct AppConfig {
     pub security: SecurityConfig,
     /// TLS 配置
     pub tls: TlsConfig,
+    /// 剪切板配置
+    pub clipboard: ClipboardConfig,
+}
+
+/// 剪切板同步配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// 是否允许剪切板同步（默认 true）。关闭后客户端的 clipboard_get/set 会被拒绝。
+    pub enabled: bool,
+    /// 单次文本同步的最大字节数，超出截断或拒绝（默认 1 MB）。
+    pub max_text_bytes: usize,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_text_bytes: 1024 * 1024,
+        }
+    }
 }
 
 /// TLS 配置
@@ -76,6 +97,7 @@ impl Default for AppConfig {
             video: VideoConfig::default(),
             security: SecurityConfig::default(),
             tls: TlsConfig::default(),
+            clipboard: ClipboardConfig::default(),
         }
     }
 }

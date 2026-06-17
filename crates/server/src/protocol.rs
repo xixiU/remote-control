@@ -24,6 +24,11 @@ pub enum ServerMsg {
     AuthFail { reason: String },
     /// 通用错误。
     Error { code: String, message: String },
+    /// 远端剪切板内容（响应客户端的 clipboard_get）。
+    ClipboardData { text: String },
+    /// 剪切板操作失败（区别于通用 Error，便于前端按按钮反馈）。
+    /// `op` 取 "get" / "set"，方便客户端定位是哪边失败。
+    ClipboardError { op: String, message: String },
     /// 心跳响应。
     Pong,
 }
@@ -73,6 +78,13 @@ pub enum ClientMsg {
     },
     /// 心跳。
     Ping,
+    /// 把本地（控制端）剪切板的文本同步到被控端。
+    ClipboardSet {
+        #[serde(default)]
+        text: String,
+    },
+    /// 请求被控端剪切板文本，服务端以 `ClipboardData` 回复。
+    ClipboardGet,
     /// 兜底：未识别的消息类型，记日志后忽略，不断连。
     #[serde(other)]
     Unknown,
@@ -256,5 +268,36 @@ mod tests {
                 action: String::new()
             }
         );
+    }
+
+    #[test]
+    fn clipboard_messages_roundtrip() {
+        let set = parse_client_msg(r#"{"type":"clipboard_set","text":"hello"}"#).unwrap();
+        assert_eq!(
+            set,
+            ClientMsg::ClipboardSet {
+                text: "hello".to_string()
+            }
+        );
+
+        let get = parse_client_msg(r#"{"type":"clipboard_get"}"#).unwrap();
+        assert_eq!(get, ClientMsg::ClipboardGet);
+
+        let data = ServerMsg::ClipboardData {
+            text: "world".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        assert!(data.contains("\"type\":\"clipboard_data\""));
+        assert!(data.contains("\"text\":\"world\""));
+
+        let err = ServerMsg::ClipboardError {
+            op: "set".to_string(),
+            message: "no x11".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        assert!(err.contains("\"type\":\"clipboard_error\""));
+        assert!(err.contains("\"op\":\"set\""));
     }
 }

@@ -20,6 +20,7 @@ use crate::input::{self, InputInjector, MouseButton};
 use crate::pipeline::CaptureEncoder;
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
 use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
+use crate::clipboard;
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
@@ -376,6 +377,12 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             debug!("{}: 收到未知 control '{}'，忽略", peer_addr, action);
                         }
                     }
+                    ClientMsg::ClipboardSet { text } => {
+                        handle_clipboard_set(&mut socket, peer_addr, &state, text).await;
+                    }
+                    ClientMsg::ClipboardGet => {
+                        handle_clipboard_get(&mut socket, peer_addr, &state).await;
+                    }
                     ClientMsg::Auth { .. } => {
                         debug!("{}: 已认证连接重复发送 auth，忽略", peer_addr);
                     }
@@ -395,6 +402,145 @@ async fn send_msg(socket: &mut WebSocket, msg: &ServerMsg) -> Result<()> {
     let text = msg.to_json()?;
     socket.send(Message::Text(text)).await?;
     Ok(())
+}
+
+/// 处理 clipboard_set：把控制端剪切板文本写入被控端系统剪切板。
+///
+/// 剪切板访问是阻塞的 X11 调用，放到 spawn_blocking 里执行，避免卡住异步运行时。
+async fn handle_clipboard_set(
+    socket: &mut WebSocket,
+    peer_addr: SocketAddr,
+    state: &Arc<AppState>,
+    text: String,
+) {
+    let cfg = &state.config.clipboard;
+    if !cfg.enabled {
+        debug!("{}: 剪切板同步已禁用，忽略 clipboard_set", peer_addr);
+        let _ = send_msg(
+            socket,
+            &ServerMsg::ClipboardError {
+                op: "set".to_string(),
+                message: "剪切板同步已被服务端禁用".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    if text.len() > cfg.max_text_bytes {
+        warn!(
+            "{}: clipboard_set 文本 {} 字节超过上限 {}，已拒绝",
+            peer_addr,
+            text.len(),
+            cfg.max_text_bytes
+        );
+        let _ = send_msg(
+            socket,
+            &ServerMsg::ClipboardError {
+                op: "set".to_string(),
+                message: format!("文本超过上限 {} 字节", cfg.max_text_bytes),
+            },
+        )
+        .await;
+        return;
+    }
+
+    // 不打印剪切板内容，只记长度。
+    debug!("{}: 写入被控端剪切板（{} 字节）", peer_addr, text.len());
+    let result = tokio::task::spawn_blocking(move || clipboard::set_text(&text)).await;
+
+    match result {
+        Ok(Ok(())) => { /* 成功无需回复 */ }
+        Ok(Err(e)) => {
+            warn!("{}: 写入剪切板失败: {}", peer_addr, e);
+            let _ = send_msg(
+                socket,
+                &ServerMsg::ClipboardError {
+                    op: "set".to_string(),
+                    message: e.to_string(),
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!("{}: 剪切板写入任务异常: {}", peer_addr, e);
+        }
+    }
+}
+
+/// 处理 clipboard_get：读取被控端系统剪切板文本，回发给控制端。
+async fn handle_clipboard_get(
+    socket: &mut WebSocket,
+    peer_addr: SocketAddr,
+    state: &Arc<AppState>,
+) {
+    let cfg = &state.config.clipboard;
+    if !cfg.enabled {
+        debug!("{}: 剪切板同步已禁用，忽略 clipboard_get", peer_addr);
+        let _ = send_msg(
+            socket,
+            &ServerMsg::ClipboardError {
+                op: "get".to_string(),
+                message: "剪切板同步已被服务端禁用".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let max = cfg.max_text_bytes;
+    let result = tokio::task::spawn_blocking(clipboard::get_text).await;
+
+    match result {
+        Ok(Ok(mut text)) => {
+            // 超长时截断到字符边界，避免把超大剪切板整个塞进 WebSocket。
+            if text.len() > max {
+                warn!(
+                    "{}: 被控端剪切板 {} 字节超过上限 {}，已截断",
+                    peer_addr,
+                    text.len(),
+                    max
+                );
+                truncate_to_char_boundary(&mut text, max);
+            }
+            debug!("{}: 读取被控端剪切板（{} 字节）", peer_addr, text.len());
+            let _ = send_msg(socket, &ServerMsg::ClipboardData { text }).await;
+        }
+        Ok(Err(e)) => {
+            warn!("{}: 读取剪切板失败: {}", peer_addr, e);
+            let _ = send_msg(
+                socket,
+                &ServerMsg::ClipboardError {
+                    op: "get".to_string(),
+                    message: e.to_string(),
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!("{}: 剪切板读取任务异常: {}", peer_addr, e);
+            let _ = send_msg(
+                socket,
+                &ServerMsg::ClipboardError {
+                    op: "get".to_string(),
+                    message: "剪切板读取任务异常".to_string(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// 把字符串截断到不超过 `max` 字节的最近字符边界，保证仍是合法 UTF-8。
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 /// 把协议层 input 事件分派到注入器。
