@@ -70,10 +70,34 @@ impl CaptureEncoder {
         mut keyframe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     ) {
         let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
+        // 无订阅者时的轮询间隔：仅用于探测是否有新连接，不抓帧不编码。
+        let idle_poll = Duration::from_millis(100);
         let mut frame_count = 0u64;
+        // 是否处于空闲（无订阅者）状态。初始为 true：启动后无连接即不工作。
+        let mut idle = true;
 
         loop {
             let loop_start = Instant::now();
+
+            // 没有任何订阅者时进入空闲：跳过抓帧与编码（编码里的逐像素
+            // BGRA→YUV 转换是主要 CPU 开销），只按 idle_poll 间隔探测新连接。
+            if tx.receiver_count() == 0 {
+                if !idle {
+                    idle = true;
+                    debug!("无订阅者，捕获编码进入空闲");
+                }
+                // 清掉空闲期间可能堆积的关键帧请求；恢复时会无条件强制一次。
+                while keyframe_rx.try_recv().is_ok() {}
+                thread::sleep(idle_poll);
+                continue;
+            }
+
+            // 从空闲恢复：强制下一帧为关键帧，确保新订阅者能拿到 SPS/PPS/IDR。
+            if idle {
+                idle = false;
+                self.encoder.request_keyframe();
+                debug!("检测到订阅者，恢复捕获并强制关键帧");
+            }
 
             // 0. 检查关键帧请求（非阻塞）
             if keyframe_rx.try_recv().is_ok() {
@@ -101,16 +125,11 @@ impl CaptureEncoder {
                 }
             };
 
-            // 3. 序列化并发送所有数据包
+            // 3. 序列化并发送所有数据包。能走到这里说明至少有一个订阅者。
             for packet in packets {
                 let binary_frame = serialize_packet(&packet);
-
-                // 发送到 broadcast channel（如果没有接收者会丢弃，无影响）
-                let receiver_count = tx.receiver_count();
-                if receiver_count > 0 {
-                    if let Err(e) = tx.send(binary_frame) {
-                        debug!("发送视频帧失败（可能所有接收者都掉线了）: {}", e);
-                    }
+                if let Err(e) = tx.send(binary_frame) {
+                    debug!("发送视频帧失败（可能所有接收者都掉线了）: {}", e);
                 }
             }
 
