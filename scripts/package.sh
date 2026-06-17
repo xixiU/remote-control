@@ -257,6 +257,21 @@ key = "your-key.pem"
 cat remotecontrol.log
 ```
 
+### 请勿用 sudo 运行
+本程序不需要 root 权限，**请用普通用户运行**（输入注入依赖当前用户的 X11 会话）。
+用 sudo 运行会引发两类问题：
+- 输入注入失败：sudo 环境下 `$DISPLAY` / `XAUTHORITY` 与你的桌面会话不一致，
+  连不上 X server，鼠标键盘无法注入。
+- 路径错乱：证书缓存 `.cache/`、`config.toml`、日志会按 root 的工作目录/权限生成，
+  普通用户后续再启动时可能读不到或冲突。
+
+若已误用 sudo 启动过，清理后重来：
+```bash
+sudo ./stop-daemon.sh 2>/dev/null || true
+sudo rm -rf .cache .remotecontrol.pid remotecontrol.log
+./start-daemon.sh   # 以普通用户重新启动
+```
+
 ### 画面无法显示
 - 检查浏览器控制台是否有 WebCodecs 错误
 - 确认浏览器支持 WebCodecs（Chrome 103+）
