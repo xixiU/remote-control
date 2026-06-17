@@ -184,6 +184,70 @@ echo "✓ 服务已停止"
 EOF
 chmod +x "$PACKAGE_DIR/stop-daemon.sh"
 echo "✓ stop-daemon.sh（停止服务）"
+
+cat > "$PACKAGE_DIR/install-autostart.sh" <<'EOF'
+#!/bin/bash
+# RemoteControl 开机自启安装脚本（非 root / 用户级）
+#
+# 本程序依赖 X11 图形会话（输入注入 + 屏幕捕获都需要 DISPLAY），
+# 采用桌面 autostart：登录图形桌面后自动拉起服务，此时 DISPLAY/XAUTHORITY 已就绪。
+# 全部写在 ~/.config/autostart/ 下，不需要 root。
+#
+# 用法:
+#   ./install-autostart.sh          # 安装
+#   ./install-autostart.sh --remove # 卸载
+
+set -e
+
+PKG_DIR="$(cd "$(dirname "$0")" && pwd)"
+START_SCRIPT="$PKG_DIR/start-daemon.sh"
+AUTOSTART_DIR="$HOME/.config/autostart"
+DESKTOP_FILE="$AUTOSTART_DIR/remotecontrol.desktop"
+
+if [[ "${1:-}" == "--remove" || "${1:-}" == "-r" ]]; then
+    echo "==> 卸载开机自启..."
+    rm -f "$DESKTOP_FILE" && echo "✓ 已删除自启项" || echo "  未找到自启项"
+    echo "  （已运行的服务不受影响，停止请执行 ./stop-daemon.sh）"
+    exit 0
+fi
+
+echo "==> 安装开机自启（用户级，无需 root）"
+
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    echo "✗ 请勿用 root/sudo 运行：开机自启需绑定你的图形桌面会话，必须以普通用户安装。"
+    exit 1
+fi
+
+if [[ ! -f "$START_SCRIPT" ]]; then
+    echo "✗ 未找到 $START_SCRIPT"
+    exit 1
+fi
+chmod +x "$START_SCRIPT"
+
+if [[ ! -f "$PKG_DIR/config.toml" ]]; then
+    echo "⚠ config.toml 不存在，建议先: cp config.example.toml config.toml 并改密码"
+fi
+
+mkdir -p "$AUTOSTART_DIR"
+cat > "$DESKTOP_FILE" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=RemoteControl Server
+Comment=远程控制被控端服务（登录后自动启动）
+Exec=bash -lc 'sleep 5; "$START_SCRIPT"'
+Path=$PKG_DIR
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+DESKTOP
+chmod +x "$DESKTOP_FILE" 2>/dev/null || true
+
+echo "✓ 已写入自启项: $DESKTOP_FILE"
+echo "  登录图形桌面后约 5 秒自动后台启动；日志: $PKG_DIR/remotecontrol.log"
+echo "  立即测试: ./start-daemon.sh    卸载自启: ./install-autostart.sh --remove"
+EOF
+chmod +x "$PACKAGE_DIR/install-autostart.sh"
+echo "✓ install-autostart.sh（开机自启）"
 echo ""
 
 echo "==> 6. 生成 README..."
@@ -222,6 +286,14 @@ tail -f remotecontrol.log
 # 停止服务
 ./stop-daemon.sh
 ```
+
+**开机自启（可选，用户级，无需 root）：**
+```bash
+./install-autostart.sh          # 安装：登录图形桌面后自动启动
+./install-autostart.sh --remove # 卸载
+```
+> 本程序依赖 X11 图形会话，自启采用桌面 autostart 方式，
+> 在你登录桌面后自动拉起。若系统设了图形自动登录，则开机即可用。
 
 ### 3. 访问控制端
 
@@ -290,6 +362,7 @@ sudo rm -rf .cache .remotecontrol.pid remotecontrol.log
 ├── start.sh                 # 前台启动脚本
 ├── start-daemon.sh          # 后台启动脚本
 ├── stop-daemon.sh           # 停止脚本
+├── install-autostart.sh     # 开机自启安装/卸载（用户级）
 └── README.md                # 本文档
 ```
 
