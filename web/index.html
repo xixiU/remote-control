@@ -37,6 +37,18 @@
             <p class="hint" id="control-hint">认证后即可发送输入。</p>
         </div>
     </div>
+
+    <!-- 顶部悬浮抽屉：鼠标移到顶部细条上展开 -->
+    <div class="top-drawer" id="top-drawer" hidden>
+        <div class="drawer-trigger" aria-hidden="true"></div>
+        <div class="drawer-content" role="toolbar" aria-label="远程控制工具栏">
+            <button type="button" id="btn-back-login" class="drawer-btn">返回登录</button>
+            <button type="button" id="btn-toggle-fullscreen" class="drawer-btn">全屏</button>
+            <button type="button" id="btn-send-clipboard" class="drawer-btn">传输本地剪切板</button>
+            <button type="button" id="btn-read-clipboard" class="drawer-btn">读取远端剪切板</button>
+        </div>
+    </div>
+
     <script src="app.js"></script>
 </body>
 </html>

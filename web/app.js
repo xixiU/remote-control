@@ -11,10 +11,17 @@ const controlPanelEl = document.getElementById('control-panel');
 const surfaceEl = document.getElementById('control-surface');
 const controlHintEl = document.getElementById('control-hint');
 const canvasEl = document.getElementById('video-canvas');
+const topDrawerEl = document.getElementById('top-drawer');
+const btnBackLoginEl = document.getElementById('btn-back-login');
+const btnToggleFullscreenEl = document.getElementById('btn-toggle-fullscreen');
+const btnSendClipboardEl = document.getElementById('btn-send-clipboard');
+const btnReadClipboardEl = document.getElementById('btn-read-clipboard');
 
 let ws = null;
 let helloReceived = false;
 let inputBound = false;
+// 用户主动断开（如点击"返回登录"）时置位，让 onclose 跳过"连接已断开"提示。
+let manualClose = false;
 
 // M3: 视频解码器
 let videoDecoder = null;
@@ -83,9 +90,15 @@ function connect() {
     };
 
     ws.onclose = () => {
+        if (manualClose) {
+            // 用户主动断开：状态已由 backToLogin() 设置，这里不再覆盖。
+            manualClose = false;
+            return;
+        }
         setStatus('连接已断开', 'fail');
         hintEl.textContent = '连接已关闭，可重新输入密码连接。';
         controlPanelEl.hidden = true;
+        exitControlMode();
     };
 
     ws.onerror = () => {
@@ -118,6 +131,7 @@ function handleMessage(msg) {
             hintEl.textContent = `会话 ID: ${msg.session_id}`;
             controlPanelEl.hidden = false;
             bindInputCapture();
+            enterControlMode();
             // 自动聚焦到输入区，方便立刻接收键盘事件。
             surfaceEl.focus();
             break;
@@ -447,3 +461,77 @@ function concatBytes(...arrays) {
     }
     return out;
 }
+
+// ========== 全屏控制模式 + 顶部抽屉 ==========
+
+/// 进入沉浸模式：隐藏登录界面，让画面铺满视口，显示顶部悬浮抽屉。
+function enterControlMode() {
+    document.body.classList.add('in-control');
+    topDrawerEl.hidden = false;
+}
+
+/// 退出沉浸模式：恢复登录界面，隐藏抽屉。
+function exitControlMode() {
+    document.body.classList.remove('in-control');
+    topDrawerEl.hidden = true;
+    topDrawerEl.classList.remove('open');
+}
+
+/// 关闭 WebSocket 并退回登录界面。
+function backToLogin() {
+    if (ws) {
+        manualClose = true;
+        try { ws.close(); } catch (_) { /* ignore */ }
+        ws = null;
+    }
+    // 若处于浏览器全屏，一并退出，避免登录界面在全屏下显示。
+    if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => { /* ignore */ });
+    }
+    exitControlMode();
+    controlPanelEl.hidden = true;
+    setStatus('未连接', 'idle');
+    hintEl.textContent = '输入密码后点击连接，验证 M1 认证流程。';
+    // 清空密码并聚焦，方便重新输入。
+    passwordEl.value = '';
+    passwordEl.focus();
+}
+
+btnBackLoginEl.addEventListener('click', () => {
+    backToLogin();
+});
+
+/// 切换浏览器全屏。请求整个文档而非 surface，避免抽屉被裹在 surface 内。
+function toggleFullscreen() {
+    if (document.fullscreenElement) {
+        document.exitFullscreen().catch((e) => console.warn('退出全屏失败:', e));
+    } else {
+        document.documentElement.requestFullscreen().catch((e) => {
+            console.warn('进入全屏失败:', e);
+        });
+    }
+}
+
+/// 同步按钮文案。用户按 ESC 也能退出全屏，所以靠 fullscreenchange 而非点击事件来更新。
+function syncFullscreenLabel() {
+    btnToggleFullscreenEl.textContent = document.fullscreenElement ? '退出全屏' : '全屏';
+}
+
+btnToggleFullscreenEl.addEventListener('click', toggleFullscreen);
+document.addEventListener('fullscreenchange', () => {
+    syncFullscreenLabel();
+    // 全屏切换会让 canvas 的显示矩形变化，焦点也可能丢失：重新聚焦到输入区。
+    if (controlPanelEl.hidden === false) {
+        surfaceEl.focus();
+    }
+});
+
+btnSendClipboardEl.addEventListener('click', () => {
+    // TODO: 实现本地剪切板传输到被控端
+    console.log('[drawer] 传输本地剪切板（功能未实现）');
+});
+
+btnReadClipboardEl.addEventListener('click', () => {
+    // TODO: 实现读取被控端剪切板
+    console.log('[drawer] 读取远端剪切板（功能未实现）');
+});

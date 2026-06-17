@@ -148,3 +148,121 @@ h1 {
     object-fit: contain;
     display: block;
 }
+
+/* ========== 全屏控制模式 ========== */
+/* 认证成功后给 body 加 .in-control，进入沉浸式画面：
+   隐藏标题/状态/登录表单，让画面铺满整个视口。 */
+body.in-control {
+    align-items: stretch;
+    justify-content: stretch;
+    overflow: hidden;
+}
+
+body.in-control .container {
+    width: 100vw;
+    height: 100vh;
+    padding: 0;
+    display: flex;
+}
+
+body.in-control h1,
+body.in-control .status,
+body.in-control #auth-panel,
+body.in-control #control-hint {
+    display: none;
+}
+
+body.in-control .control-panel {
+    margin: 0;
+    max-width: none;
+    width: 100%;
+    height: 100%;
+}
+
+body.in-control .control-surface {
+    width: 100%;
+    height: 100%;
+    aspect-ratio: auto;
+    border: none;
+    border-radius: 0;
+}
+
+body.in-control .control-surface:focus {
+    box-shadow: none;
+}
+
+/* ========== 顶部悬浮抽屉 ========== */
+.top-drawer {
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    /* 触发区与抽屉用同一个容器，保证鼠标在两者之间移动时不会触发 mouseleave。 */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+}
+
+/* 顶部一条窄热区：鼠标进入即展开抽屉。半透明便于发现。 */
+.drawer-trigger {
+    width: 160px;
+    height: 6px;
+    background: rgba(0, 212, 255, 0.45);
+    border-radius: 0 0 6px 6px;
+    pointer-events: auto;
+    transition: background 0.15s ease, height 0.15s ease;
+}
+
+.top-drawer:hover .drawer-trigger,
+.top-drawer.open .drawer-trigger {
+    background: rgba(0, 212, 255, 0.8);
+    height: 4px;
+}
+
+.drawer-content {
+    margin-top: 0;
+    padding: 0.6rem 0.9rem;
+    display: flex;
+    gap: 0.6rem;
+    background: rgba(20, 20, 40, 0.92);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-top: none;
+    border-radius: 0 0 10px 10px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    /* 默认收起：上移并淡出，鼠标 hover 触发区时滑下。 */
+    transform: translateY(-110%);
+    opacity: 0;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+    pointer-events: auto;
+}
+
+.top-drawer:hover .drawer-content,
+.top-drawer.open .drawer-content {
+    transform: translateY(0);
+    opacity: 1;
+}
+
+.drawer-btn {
+    padding: 0.45rem 0.95rem;
+    font-size: 0.92rem;
+    color: #eee;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+    white-space: nowrap;
+}
+
+.drawer-btn:hover {
+    background: rgba(0, 212, 255, 0.18);
+    border-color: rgba(0, 212, 255, 0.5);
+}
+
+.drawer-btn:active {
+    background: rgba(0, 212, 255, 0.28);
+}
