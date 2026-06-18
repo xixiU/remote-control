@@ -3,33 +3,33 @@
 
 set -e
 
-# 项目根目录
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PID_FILE="$PROJECT_DIR/.remotecontrol.pid"
+# 目录检测：主程序在同目录 → 打包模式；否则 → 开发模式
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/remotecontrol-server" ]; then
+    WORK_DIR="$SCRIPT_DIR"
+else
+    WORK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+PID_FILE="$WORK_DIR/.remotecontrol.pid"
 PROCESS_PATTERN="remotecontrol-server"
 
 echo "==> 停止 RemoteControl 服务..."
 
-# 尝试从 PID 文件读取
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
-        echo "    停止进程 $PID（从 PID 文件）..."
+        echo "    停止进程 $PID..."
         kill "$PID" 2>/dev/null || true
         sleep 2
-
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "    进程未响应，强制终止..."
-            kill -9 "$PID" 2>/dev/null || true
-        fi
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
 fi
 
-# 兜底：通过进程名查找
 REMAINING=$(pgrep -f "$PROCESS_PATTERN" 2>/dev/null || true)
 if [ -n "$REMAINING" ]; then
-    echo "    发现残留进程: $REMAINING，正在清理..."
+    echo "    清理残留进程: $REMAINING"
     pkill -f "$PROCESS_PATTERN" 2>/dev/null || true
     sleep 1
     pkill -9 -f "$PROCESS_PATTERN" 2>/dev/null || true

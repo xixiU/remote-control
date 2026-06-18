@@ -67,7 +67,24 @@ EOF
 echo "✓ config.example.toml"
 echo ""
 
-echo "==> 5. 生成启动脚本..."
+echo "==> 5. 复制运行脚本..."
+# 复制 scripts/ 中的脚本（已做目录兼容）
+cp "$PROJECT_DIR/scripts/run.sh" "$PACKAGE_DIR/start.sh"
+cp "$PROJECT_DIR/scripts/start-daemon.sh" "$PACKAGE_DIR/start-daemon.sh"
+cp "$PROJECT_DIR/scripts/stop-daemon.sh" "$PACKAGE_DIR/stop-daemon.sh"
+cp "$PROJECT_DIR/scripts/status.sh" "$PACKAGE_DIR/status.sh"
+cp "$PROJECT_DIR/scripts/install-autostart.sh" "$PACKAGE_DIR/install-autostart.sh"
+chmod +x "$PACKAGE_DIR"/*.sh
+
+echo "✓ start.sh（前台运行，来自 scripts/run.sh）"
+echo "✓ start-daemon.sh（后台运行）"
+echo "✓ stop-daemon.sh（停止服务）"
+echo "✓ status.sh（查看状态）"
+echo "✓ install-autostart.sh（开机自启）"
+echo ""
+
+# 以下为旧的内联脚本创建代码，已废弃
+: <<'DEPRECATED_INLINE_SCRIPTS'
 cat > "$PACKAGE_DIR/start.sh" <<'EOF'
 #!/bin/bash
 # RemoteControl 启动脚本
@@ -248,9 +265,7 @@ echo "✓ 已写入自启项: $DESKTOP_FILE"
 echo "  登录图形桌面后约 5 秒自动后台启动；日志: $PKG_DIR/remotecontrol.log"
 echo "  立即测试: ./start-daemon.sh    卸载自启: ./install-autostart.sh --remove"
 EOF
-chmod +x "$PACKAGE_DIR/install-autostart.sh"
-echo "✓ install-autostart.sh（开机自启）"
-echo ""
+DEPRECATED_INLINE_SCRIPTS
 
 echo "==> 6. 生成 README..."
 cat > "$PACKAGE_DIR/README.md" <<'EOF'
@@ -283,6 +298,8 @@ nano config.toml  # 修改 password 字段
 **后台运行（推荐）：**
 ```bash
 ./start-daemon.sh
+# 查看状态
+./status.sh
 # 查看日志
 tail -f remotecontrol.log
 # 停止服务
@@ -364,6 +381,7 @@ sudo rm -rf .cache .remotecontrol.pid remotecontrol.log
 ├── start.sh                 # 前台启动脚本
 ├── start-daemon.sh          # 后台启动脚本
 ├── stop-daemon.sh           # 停止脚本
+├── status.sh                # 状态查询脚本
 ├── install-autostart.sh     # 开机自启安装/卸载（用户级）
 └── README.md                # 本文档
 ```
