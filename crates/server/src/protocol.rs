@@ -20,6 +20,15 @@ pub enum ServerMsg {
     AuthOk { session_id: String },
     /// 屏幕信息（M3：认证后发送）
     ScreenInfo { width: u32, height: u32 },
+    /// 光标形状（形状变化时发送）
+    CursorShape {
+        width: u16,
+        height: u16,
+        xhot: u16,
+        yhot: u16,
+        /// RGBA 像素数据（base64 编码）
+        rgba_base64: String,
+    },
     /// 认证失败，附带原因。
     AuthFail { reason: String },
     /// 通用错误。

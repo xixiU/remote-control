@@ -1,13 +1,13 @@
 //! X11 屏幕捕获实现（基于 x11rb + MIT-SHM 共享内存扩展，零拷贝高性能）
 
-use super::{Frame, ScreenCapturer, ScreenInfo};
+use super::{CursorShape, Frame, ScreenCapturer, ScreenInfo};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::shm::{self};
+use x11rb::protocol::xfixes;
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 /// X11 屏幕捕获器，优先使用 MIT-SHM 扩展（零拷贝），降级到 XGetImage
 ///
@@ -22,6 +22,8 @@ pub struct X11Capturer {
     info: ScreenInfo,
     /// MIT-SHM 共享内存状态（可选）
     shm_state: Option<ShmState>,
+    /// XFIXES 扩展是否可用
+    xfixes_available: bool,
 }
 
 /// MIT-SHM 共享内存状态
@@ -75,11 +77,36 @@ impl X11Capturer {
             }
         };
 
+        // 检查 XFIXES 扩展是否可用并查询版本（光标捕获需要 XFIXES 2.0+）
+        let xfixes_available = match conn.extension_information(xfixes::X11_EXTENSION_NAME) {
+            Ok(Some(_)) => {
+                // 查询 XFIXES 版本
+                match xfixes::query_version(&conn, 2, 0)?.reply() {
+                    Ok(version) => {
+                        info!(
+                            "XFIXES 扩展已启用: {}.{}, 支持光标捕获",
+                            version.major_version, version.minor_version
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!("XFIXES QueryVersion 失败: {}, 光标捕获不可用", e);
+                        false
+                    }
+                }
+            }
+            _ => {
+                warn!("XFIXES 扩展不可用，无法捕获光标");
+                false
+            }
+        };
+
         Ok(Self {
             conn,
             root,
             info: ScreenInfo { width, height },
             shm_state,
+            xfixes_available,
         })
     }
 
@@ -138,66 +165,6 @@ impl X11Capturer {
             shm_size,
             shm_seg,
         })
-    }
-}
-
-impl ScreenCapturer for X11Capturer {
-    fn info(&self) -> ScreenInfo {
-        self.info.clone()
-    }
-
-    fn grab_frame(&mut self) -> Result<Frame> {
-        // 根据 MIT-SHM 状态选择抓帧方式
-        if self.shm_state.is_some() {
-            self.grab_frame_shm()
-        } else {
-            self.grab_frame_fallback()
-        }
-    }
-
-    fn refresh_info(&mut self) -> Result<bool> {
-        // 重新查询根窗口的几何信息以检测分辨率变化
-        let geom = self
-            .conn
-            .get_geometry(self.root)
-            .context("查询根窗口几何信息失败")?
-            .reply()
-            .context("接收几何信息回复失败")?;
-
-        let new_width = geom.width as u32;
-        let new_height = geom.height as u32;
-
-        if new_width != self.info.width || new_height != self.info.height {
-            info!(
-                "检测到屏幕分辨率变化: {}x{} → {}x{}",
-                self.info.width, self.info.height, new_width, new_height
-            );
-
-            // 释放旧的 MIT-SHM 资源
-            if let Some(old_state) = self.shm_state.take() {
-                Self::cleanup_shm(&self.conn, old_state);
-            }
-
-            // 更新屏幕信息
-            self.info.width = new_width;
-            self.info.height = new_height;
-
-            // 尝试重新初始化 MIT-SHM
-            match Self::init_shm(&self.conn, new_width, new_height) {
-                Ok(state) => {
-                    info!("MIT-SHM 已重新初始化为新分辨率");
-                    self.shm_state = Some(state);
-                }
-                Err(e) => {
-                    warn!("MIT-SHM 重新初始化失败，降级到 XGetImage: {}", e);
-                    self.shm_state = None;
-                }
-            }
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 }
 
@@ -338,5 +305,125 @@ impl Drop for X11Capturer {
         if let Some(state) = self.shm_state.take() {
             Self::cleanup_shm(&self.conn, state);
         }
+    }
+}
+
+impl ScreenCapturer for X11Capturer {
+    fn info(&self) -> ScreenInfo {
+        self.info.clone()
+    }
+
+    fn grab_frame(&mut self) -> Result<Frame> {
+        // 根据 MIT-SHM 状态选择抓帧方式
+        if self.shm_state.is_some() {
+            self.grab_frame_shm()
+        } else {
+            self.grab_frame_fallback()
+        }
+    }
+
+    fn refresh_info(&mut self) -> Result<bool> {
+        // 重新查询根窗口的几何信息以检测分辨率变化
+        let geom = self
+            .conn
+            .get_geometry(self.root)
+            .context("查询根窗口几何信息失败")?
+            .reply()
+            .context("接收几何信息回复失败")?;
+
+        let new_width = geom.width as u32;
+        let new_height = geom.height as u32;
+
+        if new_width != self.info.width || new_height != self.info.height {
+            info!(
+                "检测到屏幕分辨率变化: {}x{} → {}x{}",
+                self.info.width, self.info.height, new_width, new_height
+            );
+
+            // 释放旧的 MIT-SHM 资源
+            if let Some(old_state) = self.shm_state.take() {
+                Self::cleanup_shm(&self.conn, old_state);
+            }
+
+            // 更新屏幕信息
+            self.info.width = new_width;
+            self.info.height = new_height;
+
+            // 尝试重新初始化 MIT-SHM
+            match Self::init_shm(&self.conn, new_width, new_height) {
+                Ok(state) => {
+                    info!("MIT-SHM 已重新初始化为新分辨率");
+                    self.shm_state = Some(state);
+                }
+                Err(e) => {
+                    warn!("MIT-SHM 重新初始化失败，降级到 XGetImage: {}", e);
+                    self.shm_state = None;
+                }
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn get_cursor_shape(&self) -> Result<Option<CursorShape>> {
+        if !self.xfixes_available {
+            return Ok(None);
+        }
+
+        // 调用 XFIXES GetCursorImage 获取光标位图
+        let reply = xfixes::get_cursor_image(&self.conn)
+            .context("XFIXES GetCursorImage 请求失败")?
+            .reply()
+            .context("XFIXES GetCursorImage 回复失败")?;
+
+        let width = reply.width;
+        let height = reply.height;
+        let xhot = reply.xhot;
+        let yhot = reply.yhot;
+        let cursor_serial = reply.cursor_serial;
+
+        // cursor_image 是 Vec<u32>，ARGB 格式（预乘 alpha）
+        let argb_pixels = reply.cursor_image;
+
+        if argb_pixels.is_empty() {
+            return Ok(None);
+        }
+
+        // 转换为 RGBA（未预乘 alpha）
+        let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for pixel in argb_pixels {
+            let a = ((pixel >> 24) & 0xFF) as u8;
+            let r = ((pixel >> 16) & 0xFF) as u8;
+            let g = ((pixel >> 8) & 0xFF) as u8;
+            let b = (pixel & 0xFF) as u8;
+
+            // 反预乘：如果 alpha > 0，RGB 除以 (alpha / 255)
+            let (r, g, b) = if a > 0 {
+                let factor = 255.0 / a as f32;
+                (
+                    (r as f32 * factor).min(255.0) as u8,
+                    (g as f32 * factor).min(255.0) as u8,
+                    (b as f32 * factor).min(255.0) as u8,
+                )
+            } else {
+                (r, g, b)
+            };
+
+            rgba.push(r);
+            rgba.push(g);
+            rgba.push(b);
+            rgba.push(a);
+        }
+
+        Ok(Some(CursorShape {
+            width,
+            height,
+            xhot,
+            yhot,
+            rgba,
+            serial: cursor_serial,
+        }))
     }
 }

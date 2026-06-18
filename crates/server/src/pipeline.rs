@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::capture::{create_capturer, ScreenCapturer, ScreenInfo};
+use crate::capture::{create_capturer, CursorShape, ScreenCapturer, ScreenInfo};
 use crate::encoder::{EncodedPacket, H264Encoder};
 use tokio::sync::mpsc;
 
@@ -52,22 +52,25 @@ impl CaptureEncoder {
         broadcast::Sender<Vec<u8>>,
         tokio::sync::mpsc::UnboundedSender<()>,
         mpsc::UnboundedReceiver<ScreenInfo>,
+        broadcast::Sender<CursorShape>,
     ) {
         let (video_tx, _) = broadcast::channel(channel_capacity);
         let video_tx_clone = video_tx.clone();
         let (keyframe_tx, keyframe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (screen_info_tx, screen_info_rx) = mpsc::unbounded_channel();
+        let (cursor_tx, _) = broadcast::channel(8);
+        let cursor_tx_clone = cursor_tx.clone();
 
         // 独立线程运行捕获+编码循环
         thread::Builder::new()
             .name("capture-encoder".to_string())
             .spawn(move || {
-                self.run_loop(fps, bitrate, video_tx_clone, keyframe_rx, screen_info_tx);
+                self.run_loop(fps, bitrate, video_tx_clone, keyframe_rx, screen_info_tx, cursor_tx_clone);
             })
             .expect("无法启动捕获编码线程");
 
         info!("捕获编码线程已启动，目标帧率 {}fps", fps);
-        (video_tx, keyframe_tx, screen_info_rx)
+        (video_tx, keyframe_tx, screen_info_rx, cursor_tx)
     }
 
     /// 捕获编码主循环（运行在独立线程）
@@ -78,6 +81,7 @@ impl CaptureEncoder {
         tx: broadcast::Sender<Vec<u8>>,
         mut keyframe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         screen_info_tx: mpsc::UnboundedSender<ScreenInfo>,
+        cursor_tx: broadcast::Sender<CursorShape>,
     ) {
         let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
         // 无订阅者时的轮询间隔：仅用于探测是否有新连接，不抓帧不编码。
@@ -88,6 +92,8 @@ impl CaptureEncoder {
         let mut frame_count = 0u64;
         // 是否处于空闲（无订阅者）状态。初始为 true：启动后无连接即不工作。
         let mut idle = true;
+        // 上次光标序列号，用于检测光标形状变化
+        let mut last_cursor_serial: Option<u32> = None;
 
         loop {
             let loop_start = Instant::now();
@@ -109,7 +115,9 @@ impl CaptureEncoder {
             if idle {
                 idle = false;
                 self.encoder.request_keyframe();
-                debug!("检测到订阅者，恢复捕获并强制关键帧");
+                // 清空光标 serial，下一帧会强制发送当前光标
+                last_cursor_serial = None;
+                debug!("检测到订阅者，恢复捕获并强制关键帧+光标");
             }
 
             // 0. 定期检查屏幕分辨率是否变化
@@ -183,6 +191,26 @@ impl CaptureEncoder {
             frame_count += 1;
             if frame_count % (fps as u64 * 10) == 0 {
                 debug!("已编码 {} 帧", frame_count);
+            }
+
+            // 4.5. 检查光标形状变化（每帧检查，仅当 serial 变化时广播）
+            if cursor_tx.receiver_count() > 0 {
+                match self.capturer.get_cursor_shape() {
+                    Ok(Some(cursor)) => {
+                        if last_cursor_serial != Some(cursor.serial) {
+                            last_cursor_serial = Some(cursor.serial);
+                            if let Err(e) = cursor_tx.send(cursor) {
+                                debug!("广播光标形状失败: {}", e);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // 无光标或不支持，跳过
+                    }
+                    Err(e) => {
+                        debug!("获取光标形状失败: {}", e);
+                    }
+                }
             }
 
             // 5. 节流：按目标帧率间隔

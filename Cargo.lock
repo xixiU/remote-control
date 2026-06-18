@@ -1238,6 +1238,7 @@ dependencies = [
  "argon2",
  "axum",
  "axum-server",
+ "base64",
  "clap",
  "enigo",
  "libc",

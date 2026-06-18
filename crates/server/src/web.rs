@@ -21,7 +21,7 @@ use crate::pipeline::CaptureEncoder;
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
 use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
 use crate::clipboard;
-use crate::capture::ScreenInfo;
+use crate::capture::{CursorShape, ScreenInfo};
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
@@ -39,6 +39,8 @@ pub struct AppState {
     pub screen_info_tx: tokio::sync::broadcast::Sender<crate::capture::ScreenInfo>,
     /// 屏幕信息（M3）- 使用 Arc<RwLock> 支持动态更新
     pub screen_info: Arc<tokio::sync::RwLock<crate::capture::ScreenInfo>>,
+    /// 光标形状 broadcast sender
+    pub cursor_tx: tokio::sync::broadcast::Sender<CursorShape>,
 }
 
 /// 启动 HTTP 服务器：托管静态资源 + /ws WebSocket。
@@ -74,7 +76,7 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         config.video.fps,
         bitrate_bps,
     )?;
-    let (video_tx, keyframe_tx, mut screen_info_rx) = pipeline.start(
+    let (video_tx, keyframe_tx, mut screen_info_rx, cursor_tx) = pipeline.start(
         config.video.fps,
         bitrate_bps,
         8,
@@ -114,6 +116,7 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
         keyframe_tx,
         screen_info_tx,
         screen_info: screen_info_arc,
+        cursor_tx,
     });
 
     let app = Router::new()
@@ -186,6 +189,8 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
     let mut video_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>> = None;
     // 屏幕信息变化接收器：认证成功后创建
     let mut screen_info_change_rx: Option<tokio::sync::broadcast::Receiver<ScreenInfo>> = None;
+    // 光标形状变化接收器：认证成功后创建
+    let mut cursor_rx: Option<tokio::sync::broadcast::Receiver<CursorShape>> = None;
 
     loop {
         // M3: 认证后同时监听客户端消息、视频帧和屏幕信息变化
@@ -264,6 +269,41 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                         }
                         Err(e) => {
                             debug!("{}: 屏幕信息变化接收错误: {}", peer_addr, e);
+                            continue;
+                        }
+                    }
+                }
+                cursor_change = async {
+                    match cursor_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match cursor_change {
+                        Ok(cursor) => {
+                            use base64::{Engine as _, engine::general_purpose};
+                            let rgba_base64 = general_purpose::STANDARD.encode(&cursor.rgba);
+                            if let Err(e) = send_msg(
+                                &mut socket,
+                                &ServerMsg::CursorShape {
+                                    width: cursor.width,
+                                    height: cursor.height,
+                                    xhot: cursor.xhot,
+                                    yhot: cursor.yhot,
+                                    rgba_base64,
+                                },
+                            ).await {
+                                warn!("{}: 发送光标形状失败: {}", peer_addr, e);
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // 光标变化滞后可忽略
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("{}: 光标形状接收错误: {}", peer_addr, e);
                             continue;
                         }
                     }
@@ -360,6 +400,10 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                             // 订阅屏幕信息变化
                             screen_info_change_rx = Some(state.screen_info_tx.subscribe());
                             debug!("{}: 屏幕信息变化已订阅", peer_addr);
+
+                            // 订阅光标形状变化
+                            cursor_rx = Some(state.cursor_tx.subscribe());
+                            debug!("{}: 光标形状变化已订阅", peer_addr);
 
                             // 立即请求关键帧，确保新连接能收到 SPS/PPS/IDR。
                             let _ = state.keyframe_tx.send(());

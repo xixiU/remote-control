@@ -126,6 +126,10 @@ function handleMessage(msg) {
             surfaceEl.style.aspectRatio = `${screenWidth} / ${screenHeight}`;
             initVideoDecoder();
             break;
+        case 'cursor_shape':
+            // 收到光标形状，更新 CSS cursor
+            updateCursor(msg.width, msg.height, msg.xhot, msg.yhot, msg.rgba_base64);
+            break;
         case 'auth_ok':
             setStatus('Ready to control', 'ok');
             hintEl.textContent = `会话 ID: ${msg.session_id}`;
@@ -625,5 +629,39 @@ async function applyRemoteClipboard(text) {
     } catch (e) {
         console.warn('写入本地剪切板失败:', e);
         flashButton(btnReadClipboardEl, '写入被拒');
+    }
+}
+
+/// 更新控制区的光标样式
+function updateCursor(width, height, xhot, yhot, rgba_base64) {
+    try {
+        // 将 base64 解码为 Uint8Array
+        const binaryString = atob(rgba_base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // 创建 ImageData
+        const imageData = new ImageData(width, height);
+        imageData.data.set(bytes);
+
+        // 用 OffscreenCanvas 转成 data URL
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext('2d');
+        ctx.putImageData(imageData, 0, 0);
+
+        canvas.convertToBlob({ type: 'image/png' }).then(blob => {
+            const url = URL.createObjectURL(blob);
+            // CSS cursor 语法：url(data) xhot yhot, fallback
+            surfaceEl.style.cursor = `url('${url}') ${xhot} ${yhot}, auto`;
+            // 释放旧的 URL（如果有）
+            if (surfaceEl._cursorUrl) {
+                URL.revokeObjectURL(surfaceEl._cursorUrl);
+            }
+            surfaceEl._cursorUrl = url;
+        });
+    } catch (e) {
+        console.warn('更新光标失败:', e);
     }
 }

@@ -10,6 +10,19 @@ pub struct ScreenInfo {
     pub height: u32,
 }
 
+/// 光标形状信息
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorShape {
+    pub width: u16,
+    pub height: u16,
+    pub xhot: u16,
+    pub yhot: u16,
+    /// RGBA 像素数据（未预乘 alpha）
+    pub rgba: Vec<u8>,
+    /// 光标序列号（形状变化时递增）
+    pub serial: u32,
+}
+
 /// 捕获的一帧画面
 pub struct Frame {
     pub width: u32,
@@ -26,6 +39,8 @@ pub trait ScreenCapturer: Send {
     fn grab_frame(&mut self) -> Result<Frame>;
     /// 检测并更新屏幕分辨率。返回 Ok(true) 表示分辨率已变化。
     fn refresh_info(&mut self) -> Result<bool>;
+    /// 获取当前光标形状。返回 None 表示无光标或不支持。
+    fn get_cursor_shape(&self) -> Result<Option<CursorShape>>;
 }
 
 /// 工厂函数：创建当前平台的捕获器实现
