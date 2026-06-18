@@ -33,8 +33,21 @@ impl H264Encoder {
     ///
     /// - `width`, `height`: 视频分辨率
     /// - `fps`: 目标帧率
-    /// - `bitrate`: 目标码率（bps）
-    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+    /// - `bitrate`: 目标码率（bps）。传入 `<= 0`（约定 `-1`）时按分辨率与帧率
+    ///   自动估算一个适合桌面内容的码率。
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: i32) -> Result<Self> {
+        // 码率 <= 0 表示自动：按分辨率和帧率估算。
+        let bitrate = if bitrate <= 0 {
+            let auto = auto_bitrate(width, height, fps);
+            info!(
+                "码率自动估算: {} bps ({}x{} @ {}fps)",
+                auto, width, height, fps
+            );
+            auto
+        } else {
+            bitrate as u32
+        };
+
         // openh264 0.6 的 EncoderConfig::new() 不接收分辨率参数，
         // 分辨率在 encode() 时由输入 YUV 尺寸决定。
         let config = EncoderConfig::new()
@@ -147,6 +160,27 @@ impl H264Encoder {
     pub fn request_keyframe(&mut self) {
         self.encoder.force_intra_frame();
     }
+}
+
+/// 根据分辨率和帧率自动估算适合桌面内容的码率（bps）
+///
+/// 思路：以「每像素比特数 (bpp)」为基准，再按帧率相对 30fps 缩放。
+/// - 桌面内容（文字、锐利边缘）比视频更吃码率，取 bpp ≈ 0.10 作为基准，
+///   使 1080p@30fps 约为 6.2 Mbps，叠加下方下限/上限后落在清晰区间。
+/// - 低帧率下每帧分到的码率更多，按 sqrt(fps/30) 缩放避免线性下降过猛，
+///   保证 10fps 这类低帧率也维持足够清晰度。
+/// - 最终钳制在 [2 Mbps, 25 Mbps]，避免极端分辨率给出离谱值。
+fn auto_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    const BITS_PER_PIXEL: f64 = 0.10;
+    const MIN_BITRATE: f64 = 2_000_000.0;
+    const MAX_BITRATE: f64 = 25_000_000.0;
+
+    let pixels = (width as f64) * (height as f64);
+    let fps = fps.max(1) as f64;
+    let fps_factor = (fps / 30.0).sqrt();
+
+    let raw = pixels * 30.0 * BITS_PER_PIXEL * fps_factor;
+    raw.clamp(MIN_BITRATE, MAX_BITRATE) as u32
 }
 
 /// BGRA → YUV420 颜色转换（简单实现，性能优化留给 M5）

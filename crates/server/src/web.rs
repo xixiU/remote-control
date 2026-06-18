@@ -64,13 +64,19 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
     );
 
     // M3: 启动捕获编码管线
+    // 配置里的码率单位是 Mbps，转成编码器使用的 bps；-1（自动）原样透传。
+    let bitrate_bps = if config.video.bitrate <= 0 {
+        -1
+    } else {
+        config.video.bitrate * 1_000_000
+    };
     let (pipeline, screen_info) = CaptureEncoder::new(
         config.video.fps,
-        config.video.bitrate,
+        bitrate_bps,
     )?;
     let (video_tx, keyframe_tx, mut screen_info_rx) = pipeline.start(
         config.video.fps,
-        config.video.bitrate,
+        bitrate_bps,
         8,
     );
 

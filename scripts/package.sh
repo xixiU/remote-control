@@ -49,7 +49,9 @@ password = "请修改为复杂密码"
 
 [video]
 fps = 30
-bitrate = 4000000
+# 码率 (Mbps)。设为 -1 表示按分辨率与帧率自动估算（推荐）；
+# 也可手动指定，例如 8 表示 8 Mbps。桌面文字偏糊时调高此值。
+bitrate = -1
 codec = "h264"
 
 [security]

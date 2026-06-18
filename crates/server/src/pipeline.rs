@@ -22,7 +22,7 @@ pub struct CaptureEncoder {
 
 impl CaptureEncoder {
     /// 创建管线实例
-    pub fn new(fps: u32, bitrate: u32) -> Result<(Self, ScreenInfo)> {
+    pub fn new(fps: u32, bitrate: i32) -> Result<(Self, ScreenInfo)> {
         let capturer = create_capturer()
             .context("无法创建屏幕捕获器")?;
 
@@ -46,7 +46,7 @@ impl CaptureEncoder {
     pub fn start(
         self,
         fps: u32,
-        bitrate: u32,
+        bitrate: i32,
         channel_capacity: usize,
     ) -> (
         broadcast::Sender<Vec<u8>>,
@@ -74,7 +74,7 @@ impl CaptureEncoder {
     fn run_loop(
         mut self,
         fps: u32,
-        bitrate: u32,
+        bitrate: i32,
         tx: broadcast::Sender<Vec<u8>>,
         mut keyframe_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         screen_info_tx: mpsc::UnboundedSender<ScreenInfo>,

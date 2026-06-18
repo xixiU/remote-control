@@ -69,8 +69,8 @@ impl Default for TlsConfig {
 pub struct VideoConfig {
     /// 目标帧率
     pub fps: u32,
-    /// 目标码率 (bps)
-    pub bitrate: u32,
+    /// 目标码率 (Mbps)。设为 -1（默认）时按分辨率与帧率自动估算。
+    pub bitrate: i32,
     /// 编码器
     pub codec: String,
 }
@@ -106,7 +106,7 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             fps: 30,
-            bitrate: 4_000_000,
+            bitrate: -1,
             codec: "h264".to_string(),
         }
     }
