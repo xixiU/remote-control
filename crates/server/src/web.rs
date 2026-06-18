@@ -653,7 +653,16 @@ fn dispatch_input(
             };
             injector.mouse_button(btn, pressed)
         }
-        "wheel" => injector.scroll(dx, dy),
+        "wheel" => {
+            // 滚轮事件落在 X 指针当前所在窗口，所以滚动前先把指针挪到目标位置，
+            // 否则会滚到上一次指针停留的窗口（表现为「不先按一下就没反应」）。
+            // 移动失败不应阻塞滚动本身。
+            let (px, py) = norm_to_pixel(x, y, screen_width, screen_height);
+            if let Err(e) = injector.move_mouse(px, py) {
+                debug!("滚动前 move_mouse 失败（忽略，继续滚动）: {}", e);
+            }
+            injector.scroll(dx, dy)
+        }
         "key_down" | "key_up" => {
             let pressed = event == "key_down";
             injector.key(code, pressed)

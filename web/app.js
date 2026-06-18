@@ -276,8 +276,13 @@ function onMouseUp(ev) {
 }
 
 function onWheel(ev) {
+    // 带上归一化坐标，后端会先把指针挪到此处再滚动，
+    // 否则滚轮事件会落在 X 指针上一次停留的窗口而非光标所在窗口。
+    const { x, y } = normalizedFromMouse(ev);
     sendInput({
         event: 'wheel',
+        x,
+        y,
         dx: Math.round(ev.deltaX),
         dy: Math.round(ev.deltaY),
     });

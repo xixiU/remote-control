@@ -1,23 +1,73 @@
-//! X11 输入注入实现（基于 enigo 0.6.x + x11rb / XTest）。
+//! X11 输入注入实现（移动/点击/键盘走 enigo；滚轮走自带的 x11rb XTest）。
 //!
-//! 一个连接持有一个 `X11Injector`：内部包装 `enigo::Enigo`，
-//! 把 trait 抽象的 move/click/scroll/key 调用转成 enigo 调用。
+//! 一个连接持有一个 `X11Injector`。移动/点击/键盘用 `enigo::Enigo`。
+//! 滚轮不走 enigo：实测 enigo 的 Button4/5 注入在 UKUI/虚拟机环境下不生效，
+//! 而 `xdotool click 4/5`（同样走 XTest）却可用。差异在于 enigo 显式传了它查到的
+//! `IS_X_POINTER` 设备 id，这里改为复刻 xdotool 的调用：deviceid 传 0（默认设备）。
 
 use super::{keymap, InputInjector, MouseButton};
 use anyhow::{Context, Result};
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use tracing::{debug, warn};
+use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT};
+use x11rb::rust_connection::RustConnection;
 
 pub struct X11Injector {
     enigo: Enigo,
+    /// 独立的 x11rb 连接，专门用于发滚轮 XTest 事件。
+    conn: RustConnection,
 }
 
 impl X11Injector {
-    /// 初始化 enigo 实例。失败一般意味着无法连上 X server（无 DISPLAY 等）。
+    /// 初始化 enigo 实例及用于滚轮注入的 x11rb 连接。
+    /// 失败一般意味着无法连上 X server（无 DISPLAY 等）。
     pub fn new() -> Result<Self> {
         let enigo = Enigo::new(&Settings::default())
             .context("初始化 enigo（X11）失败：检查 DISPLAY 与 XTest 扩展")?;
-        Ok(Self { enigo })
+        let (conn, _) = x11rb::connect(None)
+            .context("滚轮注入：连接 X server 失败（检查 DISPLAY）")?;
+        // 确认 XTEST 扩展存在，否则滚轮注入无意义。
+        conn.extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)
+            .context("查询 XTEST 扩展失败")?
+            .context("XTEST 扩展不可用，无法注入滚轮")?;
+        Ok(Self { enigo, conn })
+    }
+
+    /// 注入 `count` 次指定方向的滚轮事件。
+    ///
+    /// 直接用 x11rb 发 XTest BUTTON_PRESS/RELEASE，`detail` 为滚轮按键号
+    /// (4=上,5=下,6=左,7=右)，`deviceid` 传 0 复刻 xdotool 的默认设备行为。
+    /// root 传 0（x11rb::NONE）表示事件落在指针当前所在屏幕。
+    fn emit_scroll(&mut self, button: u8, count: u32) -> Result<()> {
+        for _ in 0..count {
+            x11rb::protocol::xtest::fake_input(
+                &self.conn,
+                BUTTON_PRESS_EVENT,
+                button,
+                x11rb::CURRENT_TIME,
+                x11rb::NONE,
+                0,
+                0,
+                0,
+            )
+            .map_err(|e| anyhow::anyhow!("滚轮 press 失败: {e:?}"))?;
+            x11rb::protocol::xtest::fake_input(
+                &self.conn,
+                BUTTON_RELEASE_EVENT,
+                button,
+                x11rb::CURRENT_TIME,
+                x11rb::NONE,
+                0,
+                0,
+                0,
+            )
+            .map_err(|e| anyhow::anyhow!("滚轮 release 失败: {e:?}"))?;
+        }
+        self.conn
+            .flush()
+            .map_err(|e| anyhow::anyhow!("滚轮事件 flush 失败: {e:?}"))?;
+        Ok(())
     }
 }
 
@@ -70,21 +120,19 @@ impl InputInjector for X11Injector {
 
     fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
         // 浏览器 wheel 的 dy 通常以 100~120 为单位，方向：dy>0 向下、dy<0 向上。
-        // enigo Vertical 的语义：正值向下、负值向上 —— 与浏览器一致。
-        // 这里把像素级 delta 简化为离散步数（每 100px 一步、至少 1 步），
-        // 防止把巨大的 length 直接喂给 XTest 触发风暴式滚轮事件。
+        // 这里把像素级 delta 简化为离散步数（每 100px 一步、至少 1 步）。
         let steps_y = scroll_steps(dy);
         let steps_x = scroll_steps(dx);
 
         if steps_y != 0 {
-            self.enigo
-                .scroll(steps_y, Axis::Vertical)
-                .map_err(|e| anyhow::anyhow!("scroll(vertical) 失败: {e:?}"))?;
+            // X11 滚轮按键号：4=上，5=下。dy>0 向下滚 = 5，dy<0 向上滚 = 4。
+            let button = if steps_y > 0 { 5 } else { 4 };
+            self.emit_scroll(button, steps_y.unsigned_abs())?;
         }
         if steps_x != 0 {
-            self.enigo
-                .scroll(steps_x, Axis::Horizontal)
-                .map_err(|e| anyhow::anyhow!("scroll(horizontal) 失败: {e:?}"))?;
+            // 6=左，7=右。dx>0 向右滚 = 7，dx<0 向左滚 = 6。
+            let button = if steps_x > 0 { 7 } else { 6 };
+            self.emit_scroll(button, steps_x.unsigned_abs())?;
         }
         Ok(())
     }

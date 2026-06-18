@@ -39,7 +39,7 @@ thiserror = "1"
 enigo = "0.6.1"
 
 # 屏幕捕获（M3）- 纯 Rust X11 客户端，支持 MIT-SHM 共享内存扩展
-x11rb = { version = "0.13", features = ["shm"] }
+x11rb = { version = "0.13", features = ["shm", "xtest"] }
 libc = "0.2"
 
 # 系统剪切板：Linux 默认走 x11rb 后端，与本项目已有依赖一致；
