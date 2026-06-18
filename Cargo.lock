@@ -1240,6 +1240,7 @@ dependencies = [
  "axum-server",
  "clap",
  "enigo",
+ "libc",
  "openh264",
  "rcgen",
  "rustls",

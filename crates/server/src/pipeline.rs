@@ -44,7 +44,7 @@ impl CaptureEncoder {
     /// - `bitrate`: 目标码率（用于分辨率变化时重新初始化编码器）
     /// - `channel_capacity`: broadcast channel 容量（背压时丢旧帧）
     pub fn start(
-        mut self,
+        self,
         fps: u32,
         bitrate: u32,
         channel_capacity: usize,
