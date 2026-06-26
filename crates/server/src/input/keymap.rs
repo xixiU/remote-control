@@ -116,6 +116,9 @@ pub fn code_to_key(code: &str) -> Option<Key> {
         // 锁定/系统
         "CapsLock" => Some(Key::CapsLock),
         "NumLock" => Some(Key::Numlock),
+        #[cfg(target_os = "windows")]
+        "ScrollLock" => Some(Key::Scroll),
+        #[cfg(all(unix, not(target_os = "macos")))]
         "ScrollLock" => Some(Key::ScrollLock),
         "Pause" => Some(Key::Pause),
         "PrintScreen" => Some(Key::PrintScr),

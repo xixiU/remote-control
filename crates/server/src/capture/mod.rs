@@ -53,7 +53,8 @@ pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
 
     #[cfg(target_os = "windows")]
     {
-        anyhow::bail!("Windows 屏幕捕获将在后续里程碑实现")
+        let capturer = windows::WindowsCapturer::new()?;
+        return Ok(Box::new(capturer));
     }
 
     #[cfg(all(target_os = "linux", feature = "wayland"))]
