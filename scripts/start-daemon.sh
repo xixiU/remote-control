@@ -18,6 +18,30 @@ fi
 
 cd "$WORK_DIR"
 
+# X11 环境兜底：本程序依赖 X server（XTest 注入 + MIT-SHM 捕获）。
+# 在 Wayland 会话（如 Kylin V11）下，autostart 经 bash -lc 启动时不会继承
+# DISPLAY/XAUTHORITY，导致连不上 XWayland 而启动失败。这里显式兜底：
+#   1) 环境已有则沿用；
+#   2) 否则从同用户的图形会话进程 environ 中探测；
+#   3) 仍无则兜底 DISPLAY=:0、XAUTHORITY=~/.Xauthority。
+if [ -z "${DISPLAY:-}" ] || [ -z "${XAUTHORITY:-}" ]; then
+    for _p in $(pgrep -u "$(id -u)" 2>/dev/null); do
+        _env="/proc/$_p/environ"
+        [ -r "$_env" ] || continue
+        _d=$(cat "$_env" 2>/dev/null | tr '\0' '\n' | grep -m1 '^DISPLAY=' | cut -d= -f2-)
+        [ -n "$_d" ] || continue
+        [ -z "${DISPLAY:-}" ] && export DISPLAY="$_d"
+        if [ -z "${XAUTHORITY:-}" ]; then
+            _xa=$(cat "$_env" 2>/dev/null | tr '\0' '\n' | grep -m1 '^XAUTHORITY=' | cut -d= -f2-)
+            [ -n "$_xa" ] && export XAUTHORITY="$_xa"
+        fi
+        break
+    done
+fi
+[ -z "${DISPLAY:-}" ] && export DISPLAY=":0"
+[ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ] && export XAUTHORITY="$HOME/.Xauthority"
+echo "==> 图形环境: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-<none>}"
+
 # 打包模式下检查配置文件
 if [ -f "$SCRIPT_DIR/remotecontrol-server" ] && [ ! -f config.toml ]; then
     echo "错误: config.toml 不存在，请先执行:"
