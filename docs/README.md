@@ -28,6 +28,7 @@
 | --- | --- |
 | [windows/01-兼容性分析.md](windows/01-兼容性分析.md) | Windows 平台移植需求分析、实现方案、优先级建议 |
 | [windows/02-屏幕捕获实现方案.md](windows/02-屏幕捕获实现方案.md) | Desktop Duplication API 详细实现方案、流程、光标捕获、多显示器 |
+| [windows/03-输入注入实现方案.md](windows/03-输入注入实现方案.md) | SendInput API 输入注入方案、滚轮精确控制、DPI 感知、键盘映射 |
 
 ## 一句话架构
 

@@ -35,6 +35,16 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Windows: 启用 DPI 感知，确保高 DPI 显示器下鼠标坐标准确
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        // 忽略错误（可能已设置或系统不支持）
+        let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(

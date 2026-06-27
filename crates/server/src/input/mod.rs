@@ -46,15 +46,22 @@ pub trait InputInjector: Send {
 /// 工厂函数：创建当前平台的输入注入器。
 ///
 /// - Linux + feature `x11`：返回 `X11Injector`（基于 enigo + x11rb / XTest）。
+/// - Windows：返回 `WindowsInjector`（基于 enigo + SendInput）。
 /// - 其它平台：暂未实现，返回错误。
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
+    #[cfg(target_os = "windows")]
+    {
+        let injector = windows::WindowsInjector::new()?;
+        return Ok(Box::new(injector));
+    }
+
     #[cfg(all(target_os = "linux", feature = "x11"))]
     {
         let injector = x11::X11Injector::new()?;
         return Ok(Box::new(injector));
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "x11")))]
+    #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "x11"))))]
     {
         anyhow::bail!("当前平台尚未实现输入注入");
     }

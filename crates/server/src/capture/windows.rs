@@ -414,41 +414,25 @@ impl ScreenCapturer for WindowsCapturer {
                     &mut shape_info as *mut DXGI_OUTDUPL_POINTER_SHAPE_INFO,
                 ) {
                     Ok(()) => {
-                        // 只处理 COLOR 类型 (Type = 1)
-                        if shape_info.Type == 1 {
-                            // DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR
-                            let cursor_width = shape_info.Width;
-                            let cursor_height = shape_info.Height;
-                            let pitch = shape_info.Pitch as usize;
-
-                            // 转换为 RGBA 格式（BGRA -> RGBA）
-                            let mut rgba = Vec::with_capacity((cursor_width * cursor_height * 4) as usize);
-                            for row in 0..cursor_height as usize {
-                                let row_offset = row * pitch;
-                                for col in 0..cursor_width as usize {
-                                    let idx = row_offset + col * 4;
-                                    if idx + 3 < buffer.len() {
-                                        let b = buffer[idx];
-                                        let g = buffer[idx + 1];
-                                        let r = buffer[idx + 2];
-                                        let a = buffer[idx + 3];
-                                        rgba.push(r);
-                                        rgba.push(g);
-                                        rgba.push(b);
-                                        rgba.push(a);
-                                    }
-                                }
+                        // 按光标类型转换为 RGBA。DXGI 三种类型：
+                        //   1 = MONOCHROME（1bpp AND/XOR 掩码，默认箭头光标即此类）
+                        //   2 = COLOR（32 位 BGRA，直通 alpha）
+                        //   4 = MASKED_COLOR（32 位 BGRA，alpha 作掩码）
+                        match convert_pointer_shape(&buffer, &shape_info) {
+                            Some((width, height, rgba)) => {
+                                self.cursor_cache = Some(CursorShape {
+                                    width,
+                                    height,
+                                    xhot: shape_info.HotSpot.x as u16,
+                                    yhot: shape_info.HotSpot.y as u16,
+                                    rgba,
+                                    serial: self.cursor_serial,
+                                });
+                                self.cursor_serial = self.cursor_serial.wrapping_add(1);
                             }
-
-                            self.cursor_cache = Some(CursorShape {
-                                width: cursor_width as u16,
-                                height: cursor_height as u16,
-                                xhot: shape_info.HotSpot.x as u16,
-                                yhot: shape_info.HotSpot.y as u16,
-                                rgba,
-                                serial: self.cursor_serial,
-                            });
-                            self.cursor_serial = self.cursor_serial.wrapping_add(1);
+                            None => {
+                                warn!("不支持的光标类型: {}", shape_info.Type);
+                            }
                         }
                     }
                     Err(e) => {
@@ -546,5 +530,108 @@ impl Drop for WindowsCapturer {
             }
         }
         info!("Windows 屏幕捕获器已释放");
+    }
+}
+
+// DXGI 光标类型常量（DXGI_OUTDUPL_POINTER_SHAPE_TYPE）
+const DXGI_POINTER_SHAPE_TYPE_MONOCHROME: u32 = 1;
+const DXGI_POINTER_SHAPE_TYPE_COLOR: u32 = 2;
+const DXGI_POINTER_SHAPE_TYPE_MASKED_COLOR: u32 = 4;
+
+/// 把 DXGI 光标形状缓冲区转换为前端可用的未预乘 RGBA。
+///
+/// 返回 `(width, height, rgba)`；不支持的类型返回 `None`。
+///
+/// 三种类型来自 `DXGI_OUTDUPL_POINTER_SHAPE_INFO::Type`：
+/// - MONOCHROME(1)：1bpp，高 height/2 行是 AND 掩码、后 height/2 行是 XOR 掩码。
+///   按位组合：AND=0,XOR=0 → 黑；AND=0,XOR=1 → 白；AND=1,XOR=0 → 透明；
+///   AND=1,XOR=1 → 反色（这里近似为黑色不透明，足以正确显示标准箭头）。
+/// - COLOR(2)：32 位 BGRA，alpha 为直通（straight）alpha，直接换序即可。
+/// - MASKED_COLOR(4)：32 位 BGRA，alpha 字节为 0 表示不透明、0xFF 表示与背景异或；
+///   这里把 0 视为不透明、非 0 视为透明，保证基本可见。
+fn convert_pointer_shape(
+    buffer: &[u8],
+    info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+) -> Option<(u16, u16, Vec<u8>)> {
+    let width = info.Width as usize;
+    let pitch = info.Pitch as usize;
+
+    match info.Type {
+        DXGI_POINTER_SHAPE_TYPE_COLOR => {
+            let height = info.Height as usize;
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for row in 0..height {
+                let row_off = row * pitch;
+                for col in 0..width {
+                    let idx = row_off + col * 4;
+                    if idx + 3 < buffer.len() {
+                        // BGRA -> RGBA，alpha 直通（不反预乘）
+                        rgba.push(buffer[idx + 2]); // R
+                        rgba.push(buffer[idx + 1]); // G
+                        rgba.push(buffer[idx]); // B
+                        rgba.push(buffer[idx + 3]); // A
+                    } else {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+            }
+            Some((width as u16, height as u16, rgba))
+        }
+        DXGI_POINTER_SHAPE_TYPE_MASKED_COLOR => {
+            let height = info.Height as usize;
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for row in 0..height {
+                let row_off = row * pitch;
+                for col in 0..width {
+                    let idx = row_off + col * 4;
+                    if idx + 3 < buffer.len() {
+                        let mask = buffer[idx + 3];
+                        // mask==0 → 不透明；否则透明
+                        let a = if mask == 0 { 255 } else { 0 };
+                        rgba.push(buffer[idx + 2]); // R
+                        rgba.push(buffer[idx + 1]); // G
+                        rgba.push(buffer[idx]); // B
+                        rgba.push(a);
+                    } else {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+            }
+            Some((width as u16, height as u16, rgba))
+        }
+        DXGI_POINTER_SHAPE_TYPE_MONOCHROME => {
+            // 单色光标：总高度的上半是 AND 掩码、下半是 XOR 掩码。
+            let height = info.Height as usize / 2;
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for row in 0..height {
+                let and_off = row * pitch;
+                let xor_off = (row + height) * pitch;
+                for col in 0..width {
+                    let byte = col / 8;
+                    let bit = 7 - (col % 8);
+                    let and_bit = buffer
+                        .get(and_off + byte)
+                        .map(|b| (b >> bit) & 1)
+                        .unwrap_or(1);
+                    let xor_bit = buffer
+                        .get(xor_off + byte)
+                        .map(|b| (b >> bit) & 1)
+                        .unwrap_or(0);
+
+                    let (r, g, b, a) = match (and_bit, xor_bit) {
+                        (0, 0) => (0, 0, 0, 255),       // 黑色不透明
+                        (0, 1) => (255, 255, 255, 255), // 白色不透明
+                        (1, 0) => (0, 0, 0, 0),          // 透明
+                        _ => (0, 0, 0, 255),             // 反色近似为黑
+                    };
+                    rgba.push(r);
+                    rgba.push(g);
+                    rgba.push(b);
+                    rgba.push(a);
+                }
+            }
+            Some((width as u16, height as u16, rgba))
+        }
+        _ => None,
     }
 }
