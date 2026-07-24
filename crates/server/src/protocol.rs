@@ -94,6 +94,12 @@ pub enum ClientMsg {
     },
     /// 请求被控端剪切板文本，服务端以 `ClipboardData` 回复。
     ClipboardGet,
+    /// 发送特殊快捷键组合（浏览器无法捕获的系统键）。
+    SpecialKey {
+        /// 快捷键标识："alt_f4" / "ctrl_alt_del" 等。
+        #[serde(default)]
+        key: String,
+    },
     /// 兜底：未识别的消息类型，记日志后忽略，不断连。
     #[serde(other)]
     Unknown,
@@ -308,5 +314,24 @@ mod tests {
         .unwrap();
         assert!(err.contains("\"type\":\"clipboard_error\""));
         assert!(err.contains("\"op\":\"set\""));
+    }
+
+    #[test]
+    fn special_key_message_parses() {
+        let msg = parse_client_msg(r#"{"type":"special_key","key":"alt_f4"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::SpecialKey {
+                key: "alt_f4".to_string()
+            }
+        );
+
+        let msg2 = parse_client_msg(r#"{"type":"special_key","key":"ctrl_alt_del"}"#).unwrap();
+        match msg2 {
+            ClientMsg::SpecialKey { key } => {
+                assert_eq!(key, "ctrl_alt_del");
+            }
+            _ => panic!("应解析为 SpecialKey"),
+        }
     }
 }

@@ -14,6 +14,8 @@ const canvasEl = document.getElementById('video-canvas');
 const topDrawerEl = document.getElementById('top-drawer');
 const btnBackLoginEl = document.getElementById('btn-back-login');
 const btnToggleFullscreenEl = document.getElementById('btn-toggle-fullscreen');
+const btnSendAltF4El = document.getElementById('btn-send-alt-f4');
+const btnSendCtrlAltDelEl = document.getElementById('btn-send-ctrl-alt-del');
 const btnSendClipboardEl = document.getElementById('btn-send-clipboard');
 const btnReadClipboardEl = document.getElementById('btn-read-clipboard');
 
@@ -327,7 +329,11 @@ function bindInputCapture() {
     surfaceEl.addEventListener('keydown', onKeyDown);
     surfaceEl.addEventListener('keyup', onKeyUp);
 
-    controlHintEl.textContent = '已就绪：移动/点击鼠标、按键将注入被控端。';
+    const hint = '已就绪：移动/点击鼠标、按键将注入被控端。';
+    const lockHint = navigator.keyboard && navigator.keyboard.lock
+        ? '（全屏后可捕获系统快捷键）'
+        : '（浏览器不支持系统快捷键捕获）';
+    controlHintEl.textContent = hint + lockHint;
 }
 
 formEl.addEventListener('submit', (ev) => {
@@ -546,13 +552,30 @@ btnBackLoginEl.addEventListener('click', () => {
 });
 
 /// 切换浏览器全屏。请求整个文档而非 surface，避免抽屉被裹在 surface 内。
-function toggleFullscreen() {
+async function toggleFullscreen() {
     if (document.fullscreenElement) {
+        // 退出全屏时解除键盘锁定
+        if (navigator.keyboard && navigator.keyboard.unlock) {
+            navigator.keyboard.unlock();
+        }
         document.exitFullscreen().catch((e) => console.warn('退出全屏失败:', e));
     } else {
-        document.documentElement.requestFullscreen().catch((e) => {
+        try {
+            await document.documentElement.requestFullscreen();
+            // 进入全屏后锁定系统按键，让它们能被 keydown 捕获。
+            if (navigator.keyboard && navigator.keyboard.lock) {
+                await navigator.keyboard.lock([
+                    'AltLeft', 'AltRight',
+                    'F4', 'F11',
+                    'Tab', 'Escape',
+                    'MetaLeft', 'MetaRight'  // Windows 键
+                ]).catch((e) => {
+                    console.warn('键盘锁定失败:', e);
+                });
+            }
+        } catch (e) {
             console.warn('进入全屏失败:', e);
-        });
+        }
     }
 }
 
@@ -577,6 +600,20 @@ btnSendClipboardEl.addEventListener('click', () => {
 btnReadClipboardEl.addEventListener('click', () => {
     readRemoteClipboard();
 });
+
+btnSendAltF4El.addEventListener('click', () => {
+    sendSpecialKey('alt_f4');
+});
+
+btnSendCtrlAltDelEl.addEventListener('click', () => {
+    sendSpecialKey('ctrl_alt_del');
+});
+
+/// 发送特殊快捷键组合（浏览器无法捕获的）
+function sendSpecialKey(key) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'special_key', key }));
+}
 
 /// 短暂改按钮文案做反馈，到时恢复原文案。
 function flashButton(btn, text, ms = 1500) {
