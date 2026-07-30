@@ -45,8 +45,9 @@ pub trait InputInjector: Send {
 
 /// 工厂函数：创建当前平台的输入注入器。
 ///
-/// - Linux + feature `x11`：返回 `X11Injector`（基于 enigo + x11rb / XTest）。
 /// - Windows：返回 `WindowsInjector`（基于 enigo + SendInput）。
+/// - Linux Wayland 会话（feature `wayland`）：返回 `WaylandInjector`（当前实现走 Xwayland/XTest 桥接）。
+/// - Linux X11 会话（feature `x11`）：返回 `X11Injector`（基于 enigo + x11rb / XTest）。
 /// - 其它平台：暂未实现，返回错误。
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "windows")]
@@ -55,19 +56,41 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
         return Ok(Box::new(injector));
     }
 
-    #[cfg(all(target_os = "linux", feature = "x11"))]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    {
+        if is_wayland_session() {
+            let injector = wayland::WaylandInjector::new()?;
+            return Ok(Box::new(injector));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "x11", feature = "wayland")))]
     {
         let injector = x11::X11Injector::new()?;
         return Ok(Box::new(injector));
     }
 
-    #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "x11"))))]
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", any(feature = "x11", feature = "wayland")),
+    )))]
     {
         anyhow::bail!("当前平台尚未实现输入注入");
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "x11"))]
+/// 判断当前是否运行在 Wayland 会话中。
+///
+/// 判定顺序：`WAYLAND_DISPLAY` 非空 > `XDG_SESSION_TYPE == "wayland"`。
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+fn is_wayland_session() -> bool {
+    if std::env::var("WAYLAND_DISPLAY").ok().filter(|v| !v.is_empty()).is_some() {
+        return true;
+    }
+    matches!(std::env::var("XDG_SESSION_TYPE").as_deref(), Ok("wayland"))
+}
+
+#[cfg(all(target_os = "linux", any(feature = "x11", feature = "wayland")))]
 mod x11;
 
 #[cfg(target_os = "windows")]
