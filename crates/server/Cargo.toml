@@ -5,9 +5,14 @@ edition = "2021"
 description = "RemoteControl 被控端服务"
 
 [features]
-default = ["x11"]
+# 默认同时启用 x11 与 wayland：Linux 下的同一份二进制能在启动时
+# 通过 WAYLAND_DISPLAY / XDG_SESSION_TYPE 自动切到对应后端。
+default = ["x11", "wayland"]
 x11 = []
-wayland = []
+# Wayland 支持：当前实现以 Xwayland 作为桥接（复用 x11rb 与 XTest），
+# 因此启用 wayland 时自动带上 x11 编译单元；后续接入 PipeWire/portal 时
+# 会再拆分为独立后端。
+wayland = ["x11"]
 
 [dependencies]
 # Web 服务器 + 异步运行时
