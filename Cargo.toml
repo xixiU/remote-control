@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/server"]
+
+[patch.crates-io]
+openh264-sys2 = { path = "vendor/openh264-sys2" }

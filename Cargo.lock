@@ -1041,8 +1041,6 @@ dependencies = [
 [[package]]
 name = "openh264-sys2"
 version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a77c1e18503537113d77b1b1d05274e81fa9f44843c06be2d735adb19f7c9d"
 dependencies = [
  "cc",
  "nasm-rs",
