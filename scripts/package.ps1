@@ -1,5 +1,18 @@
 # RemoteControl 打包脚本 (Windows PowerShell)
 # 生成可分发的二进制包，包含可执行文件、静态资源、配置示例、运行脚本
+#
+# 可选参数（供 CI 使用；都不传时行为与以往完全一致）：
+#   -PackageName  包名（不含扩展名），默认 remotecontrol-<arch>-win-<时间戳>
+#   -OutDir       输出目录，默认 dist
+#   -TargetDir    二进制所在目录，默认 target\release
+#   -SkipBuild    跳过 cargo build（CI 已单独编译过，便于加 --locked 和看完整日志）
+
+param(
+    [string]$PackageName,
+    [string]$OutDir = "dist",
+    [string]$TargetDir = "target\release",
+    [switch]$SkipBuild
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -8,10 +21,12 @@ $ProjectDir = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectDir
 
 # 打包输出目录
-$Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "AMD64") { "x86_64" } else { "x86" }
-$DateStr = Get-Date -Format "yyyyMMdd-HHmmss"
-$PackageName = "remotecontrol-$Arch-win-$DateStr"
-$PackageDir = "dist\$PackageName"
+if ([string]::IsNullOrWhiteSpace($PackageName)) {
+    $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "AMD64") { "x86_64" } else { "x86" }
+    $DateStr = Get-Date -Format "yyyyMMdd-HHmmss"
+    $PackageName = "remotecontrol-$Arch-win-$DateStr"
+}
+$PackageDir = Join-Path $OutDir $PackageName
 
 Write-Host "==> RemoteControl 打包脚本 (Windows)"
 Write-Host "    目标: $PackageDir"
@@ -23,13 +38,18 @@ if (Test-Path $PackageDir) {
 }
 New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
 
-Write-Host "==> 1. 编译 release 二进制..."
-cargo build --release 2>&1 | Select-Object -Last 5
-Write-Host "✓ 编译完成"
-Write-Host ""
+if ($SkipBuild) {
+    Write-Host "==> 1. 跳过编译（-SkipBuild）"
+    Write-Host ""
+} else {
+    Write-Host "==> 1. 编译 release 二进制..."
+    cargo build --release 2>&1 | Select-Object -Last 5
+    Write-Host "✓ 编译完成"
+    Write-Host ""
+}
 
 Write-Host "==> 2. 复制二进制文件..."
-$BinPath = "$ProjectDir\target\release\remotecontrol-server.exe"
+$BinPath = Join-Path $ProjectDir (Join-Path $TargetDir "remotecontrol-server.exe")
 Copy-Item $BinPath $PackageDir
 $BinSize = (Get-Item "$PackageDir\remotecontrol-server.exe").Length / 1MB
 Write-Host "✓ 二进制: $($BinSize.ToString('0.00')) MB"
@@ -199,15 +219,16 @@ Write-Host "✓ README.md"
 Write-Host ""
 
 Write-Host "==> 7. 打包为 ZIP..."
-$ZipPath = "dist\$PackageName.zip"
+$ZipPath = Join-Path $OutDir "$PackageName.zip"
 Compress-Archive -Path $PackageDir -DestinationPath $ZipPath -Force
 $ZipSize = (Get-Item $ZipPath).Length / 1MB
 Write-Host "✓ $PackageName.zip ($($ZipSize.ToString('0.00')) MB)"
 Write-Host ""
 
 Write-Host "==> 8. 生成打包清单..."
-Get-ChildItem $PackageDir -Recurse | Select-Object FullName, Length | Out-File "dist\$PackageName.list.txt"
-Write-Host "✓ 文件清单: dist\$PackageName.list.txt"
+$ListPath = Join-Path $OutDir "$PackageName.list.txt"
+Get-ChildItem $PackageDir -Recurse | Select-Object FullName, Length | Out-File $ListPath
+Write-Host "✓ 文件清单: $ListPath"
 Write-Host ""
 
 Write-Host "=========================================="

@@ -11,26 +11,40 @@ cd "$PROJECT_DIR"
 # 确保 cargo 在 PATH 中
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# 打包输出目录
-PACKAGE_NAME="remotecontrol-$(uname -m)-$(date +%Y%m%d-%H%M%S)"
-PACKAGE_DIR="dist/$PACKAGE_NAME"
+# ---- 可选环境变量覆盖（供 CI 使用；不设置时行为与以往完全一致）----
+#   PACKAGE_NAME  包名（不含扩展名），默认 remotecontrol-<arch>-<时间戳>
+#   OUT_DIR       输出目录，默认 dist
+#   TARGET_DIR    二进制所在目录，默认 target/release（交叉编译时传 target/<triple>/release）
+#   STRIP         strip 工具名，默认 strip（交叉编译时传 <triple>-strip）
+#   SKIP_BUILD    非空则跳过 cargo build（CI 已单独编译过，便于加 --locked 和看完整日志）
+PACKAGE_NAME="${PACKAGE_NAME:-remotecontrol-$(uname -m)-$(date +%Y%m%d-%H%M%S)}"
+OUT_DIR="${OUT_DIR:-dist}"
+TARGET_DIR="${TARGET_DIR:-target/release}"
+STRIP="${STRIP:-strip}"
+
+PACKAGE_DIR="$OUT_DIR/$PACKAGE_NAME"
 
 echo "==> RemoteControl 打包脚本"
 echo "    目标: $PACKAGE_DIR"
 echo ""
 
 # 清理旧的打包目录
-rm -rf "dist/$PACKAGE_NAME"
+rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR"
 
-echo "==> 1. 编译 release 二进制..."
-cargo build --release 2>&1 | tail -5
-echo "✓ 编译完成"
-echo ""
+if [ -n "${SKIP_BUILD:-}" ]; then
+    echo "==> 1. 跳过编译（SKIP_BUILD 已设置）"
+    echo ""
+else
+    echo "==> 1. 编译 release 二进制..."
+    cargo build --release 2>&1 | tail -5
+    echo "✓ 编译完成"
+    echo ""
+fi
 
 echo "==> 2. 复制二进制文件..."
-cp target/release/remotecontrol-server "$PACKAGE_DIR/"
-strip "$PACKAGE_DIR/remotecontrol-server" 2>/dev/null || true  # 去除调试符号减小体积
+cp "$TARGET_DIR/remotecontrol-server" "$PACKAGE_DIR/"
+"$STRIP" "$PACKAGE_DIR/remotecontrol-server" 2>/dev/null || true  # 去除调试符号减小体积
 echo "✓ 二进制: $(du -h "$PACKAGE_DIR/remotecontrol-server" | cut -f1)"
 echo ""
 
@@ -398,26 +412,26 @@ echo "✓ README.md"
 echo ""
 
 echo "==> 7. 打包为 tar.gz..."
-cd dist
+cd "$OUT_DIR"
 tar czf "${PACKAGE_NAME}.tar.gz" "$PACKAGE_NAME"
 PACKAGE_SIZE=$(du -h "${PACKAGE_NAME}.tar.gz" | cut -f1)
 echo "✓ ${PACKAGE_NAME}.tar.gz ($PACKAGE_SIZE)"
-cd ..
+cd "$PROJECT_DIR"
 echo ""
 
 echo "==> 8. 生成打包清单..."
 tree -L 2 "$PACKAGE_DIR" > "$PACKAGE_DIR.list.txt" 2>/dev/null || find "$PACKAGE_DIR" -maxdepth 2 -print | sort > "$PACKAGE_DIR.list.txt"
-echo "✓ 文件清单: dist/${PACKAGE_NAME}.list.txt"
+echo "✓ 文件清单: $OUT_DIR/${PACKAGE_NAME}.list.txt"
 echo ""
 
 echo "=========================================="
 echo "✓ 打包完成！"
 echo ""
-echo "压缩包: dist/${PACKAGE_NAME}.tar.gz ($PACKAGE_SIZE)"
+echo "压缩包: $OUT_DIR/${PACKAGE_NAME}.tar.gz ($PACKAGE_SIZE)"
 echo "源目录: $PACKAGE_DIR"
 echo ""
 echo "分发给其他电脑使用:"
-echo "  1. scp dist/${PACKAGE_NAME}.tar.gz user@remote:/path/"
+echo "  1. scp $OUT_DIR/${PACKAGE_NAME}.tar.gz user@remote:/path/"
 echo "  2. ssh user@remote"
 echo "  3. tar xzf ${PACKAGE_NAME}.tar.gz"
 echo "  4. cd $PACKAGE_NAME"

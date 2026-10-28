@@ -1,0 +1,354 @@
+# 发布流程：多平台编译 + 发布 GitHub Release
+#
+# 两种触发方式，都能产出完整的多平台产物：
+#   1. 推送 tag：git tag v0.1.0 && git push origin v0.1.0 → 自动构建三平台并直接发布 Release
+#   2. 手动触发（Actions 页面 → Release → Run workflow）→ 可自选版本号、是否建 Release、
+#      只编某一个平台。不建 Release 时产物仍上传为 artifact，可在本次 run 页面底部直接下载。
+#      本地没有 Rust 环境也能靠这条路出包。
+#
+# 龙芯（loongarch64）不在本流程内，需在龙芯机器上原生编译：
+#   bash scripts/一键安装rust.sh && ./scripts/package.sh
+# 原因：GitHub 无龙芯 runner；Ubuntu 源无交叉工具链（仅 Debian trixie/sid 有）；
+# 且龙芯存在「旧世界 / 新世界」ABI 分裂——上游工具链产出新世界 ELF（需 glibc>=2.36），
+# 而 Loongnix / 麒麟等在售系统多为 kernel 4.19 + glibc<2.34 的旧世界，交叉产物大概率跑不起来。
+# 提交 572478a「适配龙芯架构」当初也是原生编译的。
+#
+# Release 策略：**直接发布**（draft: false），变更说明由 GitHub 自动生成
+# （generate_release_notes: true，按上一个 tag 之间的提交/PR 汇总）。
+# 之所以不用草稿：本项目 tag 即发布，草稿需要人工再点一次，容易忘；
+# 若要改成草稿流程，把下面 release job 里的 draft 改成 true 即可。
+#
+# 为什么全部用原生 runner、不做交叉编译：
+#   openh264 走 vendor/openh264-sys2 的 source feature，会用 cc 编译 upstream 的 91 个 C++ 文件；
+#   ring 也带各架构汇编。交叉编译这两者需要配 CC/CXX/AR/linker 一整套，易碎。
+#   GitHub 已提供 arm64 原生 runner（ubuntu-22.04-arm），直接原生编译最稳。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不含 v 前缀，如 0.1.0）。留空则自动取 Cargo.toml 版本 + 短 commit"
+        type: string
+        required: false
+        default: ""
+      create_release:
+        description: "是否创建 GitHub Release（不勾选则只上传 artifact，在本次 run 页面底部下载）"
+        type: boolean
+        required: false
+        default: true
+      target:
+        description: "要构建的平台（all = 全部三个平台）"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - linux-x86_64
+          - linux-aarch64
+          - windows-x86_64
+
+permissions:
+  contents: write # 创建 Release / 上传产物需要写权限；使用内置 GITHUB_TOKEN，无需额外密钥
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 统一算一次版本号与构建矩阵，避免各平台各算一遍算出不一样的结果
+  meta:
+    name: 准备版本号与构建矩阵
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7
+
+      - name: 解析版本号
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # tag 触发：v0.1.0 → 0.1.0
+            VERSION="${GITHUB_REF_NAME#v}"
+            PRERELEASE=false
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            # 手动触发且填了版本号：原样使用（去掉用户可能多打的 v 前缀）
+            VERSION="${INPUT_VERSION#v}"
+            PRERELEASE=false
+          else
+            # 手动触发且没填：Cargo.toml 版本 + 短 commit，并标记为预发布，
+            # 避免这种临时包在仓库首页被显示成 "Latest release"
+            CARGO_VER="$(grep -m1 '^version' crates/server/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+            VERSION="${CARGO_VER}-dev.$(git rev-parse --short HEAD)"
+            PRERELEASE=true
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "版本号: ${VERSION}（预发布: ${PRERELEASE}）"
+
+      - name: 生成构建矩阵
+        id: matrix
+        env:
+          # tag 触发时 inputs.target 为空字符串，会落到 * 分支（全部平台）
+          SELECTED: ${{ inputs.target }}
+        # 手动触发可只编一个平台省时间；tag 触发恒为全部三个平台。
+        # 输出 JSON 给下面 strategy.matrix 用 fromJSON 消费。
+        run: |
+          set -euo pipefail
+          # ubuntu-22.04 是当前最老的可用 hosted 镜像（glibc 2.35），兼容性优于 24.04(2.39)
+          LINUX_X64='{"name":"linux-x86_64","runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","os":"linux"}'
+          # arm64 原生 runner，公开仓库免费
+          LINUX_ARM='{"name":"linux-aarch64","runner":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","os":"linux"}'
+          WIN_X64='{"name":"windows-x86_64","runner":"windows-latest","target":"x86_64-pc-windows-msvc","os":"windows"}'
+
+          case "${SELECTED:-all}" in
+            linux-x86_64)   INCLUDE="[${LINUX_X64}]" ;;
+            linux-aarch64)  INCLUDE="[${LINUX_ARM}]" ;;
+            windows-x86_64) INCLUDE="[${WIN_X64}]" ;;
+            *)              INCLUDE="[${LINUX_X64},${LINUX_ARM},${WIN_X64}]" ;;
+          esac
+
+          echo "matrix={\"include\":${INCLUDE}}" >> "$GITHUB_OUTPUT"
+          echo "构建平台选择: ${SELECTED:-all}"
+          echo "${INCLUDE}"
+
+  build:
+    name: 构建 ${{ matrix.name }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false # 一个平台挂了不影响其他平台编完出包
+      matrix: ${{ fromJSON(needs.meta.outputs.matrix) }}
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7
+
+      - name: 安装系统依赖 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # build-essential: openh264 upstream C++ 源码编译
+          # libxkbcommon-dev: enigo 在 unix(非 macOS) 下无条件依赖 xkbcommon crate，
+          #                   该 crate 无 build.rs，直接 #[link] 系统库，缺失会在链接期报错
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libxkbcommon-dev
+          # nasm 只对 x86/x86_64 有意义：build.rs 的 NasmConfiguration::find 对其他架构
+          # 直接返回 None，aarch64 下装了也不会被用到
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y --no-install-recommends nasm
+          fi
+
+      - name: 安装 nasm (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # Windows 镜像未预装 nasm；choco 包不写 PATH，需手动追加
+          choco install nasm -y --no-progress
+          "$env:ProgramFiles\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: 恢复 cargo 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          # 注意：vendor/openh264-sys2 的 C++ 产物不会被缓存（它是仓库内 path patch，
+          # 既不在 workspace 根之外、也不是 workspace 成员，会被 rust-cache 的 target 清理删掉）。
+          # 详细推导见 ci.yml 同位置注释。缓存收益来自 Rust 依赖本身。
+
+      # 编译单独成步骤（不交给 package 脚本做）：这样能加 --locked、日志完整、失败点清晰
+      - name: 编译 release 二进制
+        run: cargo build --locked --release
+
+      - name: 打包 (Linux)
+        if: matrix.os == 'linux'
+        env:
+          SKIP_BUILD: "1" # 上一步已编译，脚本不再重复编译
+          PACKAGE_NAME: remotecontrol-${{ needs.meta.outputs.version }}-${{ matrix.target }}
+        run: ./scripts/package.sh
+
+      - name: 打包 (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild -PackageName "remotecontrol-${{ needs.meta.outputs.version }}-${{ matrix.target }}"
+
+      # 防「空包静默发布」：三道检查——二进制本体非空、压缩包存在、包内含关键文件。
+      # 刻意**不**对压缩包体积设阈值：压缩率不可控（实测全零/低熵内容 1.3MB 能压到 1.6KB），
+      # 拿压缩后大小判断会误判。所以体积只查未压缩的二进制本体。
+      - name: 校验产物 (Linux)
+        if: matrix.os == 'linux'
+        env:
+          PKG: dist/remotecontrol-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
+        run: |
+          set -euo pipefail
+          # 1) 二进制本体：静态链接了 openh264，正常远大于 1MB。
+          #    空文件 / 链接失败留下的残件会被这一步挡住
+          BIN=target/release/remotecontrol-server
+          if [ ! -f "$BIN" ]; then
+            echo "✗ 二进制不存在: $BIN" >&2
+            exit 1
+          fi
+          BIN_SIZE=$(stat -c%s "$BIN")
+          echo "二进制: $BIN ($BIN_SIZE 字节)"
+          if [ "$BIN_SIZE" -lt 1048576 ]; then
+            echo "✗ 二进制体积异常偏小（<1MB），疑似编译或链接出了问题" >&2
+            exit 1
+          fi
+
+          # 2) 压缩包存在且非空
+          if [ ! -f "$PKG" ]; then
+            echo "✗ 产物不存在: $PKG" >&2
+            ls -la dist/ || true
+            exit 1
+          fi
+          PKG_SIZE=$(stat -c%s "$PKG")
+          echo "产物: $PKG ($PKG_SIZE 字节)"
+          [ "$PKG_SIZE" -gt 0 ] || { echo "✗ 产物是空文件" >&2; exit 1; }
+
+          # 3) 包内含关键文件，而不是只打进了一堆脚本
+          LIST=$(tar tzf "$PKG")
+          for must in remotecontrol-server web/ config.example.toml; do
+            echo "$LIST" | grep -q "$must" || { echo "✗ 包内缺少 $must" >&2; exit 1; }
+          done
+          echo "✓ 产物校验通过"
+
+      - name: 校验产物 (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          PKG: dist/remotecontrol-${{ needs.meta.outputs.version }}-${{ matrix.target }}.zip
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # 1) 二进制本体：静态链接了 openh264，正常远大于 1MB
+          $bin = "target\release\remotecontrol-server.exe"
+          if (-not (Test-Path $bin)) {
+              Write-Host "✗ 二进制不存在: $bin"
+              exit 1
+          }
+          $binSize = (Get-Item $bin).Length
+          Write-Host "二进制: $bin ($binSize 字节)"
+          if ($binSize -lt 1MB) {
+              Write-Host "✗ 二进制体积异常偏小（<1MB），疑似编译或链接出了问题"
+              exit 1
+          }
+
+          # 2) 压缩包存在且非空（不设体积阈值，理由见 Linux 校验步骤注释）
+          if (-not (Test-Path $env:PKG)) {
+              Write-Host "✗ 产物不存在: $($env:PKG)"
+              Get-ChildItem dist -ErrorAction SilentlyContinue
+              exit 1
+          }
+          $size = (Get-Item $env:PKG).Length
+          Write-Host "产物: $($env:PKG) ($size 字节)"
+          if ($size -le 0) {
+              Write-Host "✗ 产物是空文件"
+              exit 1
+          }
+
+          # 3) 包内含关键文件。
+          #    注意：Compress-Archive 写出的 entry 用反斜杠（如 pkg\web\index.html），
+          #    所以统一把 \ 换成 / 再匹配，否则 "web/" 永远匹配不上
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $env:PKG).Path)
+          try {
+              $names = $zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') }
+          } finally {
+              $zip.Dispose()
+          }
+          Write-Host "包内文件数: $($names.Count)"
+          foreach ($must in @("remotecontrol-server.exe", "web/", "config.example.toml")) {
+              if (-not ($names -match [regex]::Escape($must))) {
+                  Write-Host "✗ 包内缺少 $must"
+                  Write-Host "实际内容: $($names -join ' | ')"
+                  exit 1
+              }
+          }
+          Write-Host "✓ 产物校验通过"
+
+      - name: 上传产物到本次 run
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.target }}
+          # 只收压缩包，不收解包后的目录和 .list.txt
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          # 不建 Release 时这是用户唯一的下载途径，留久一点
+          retention-days: 30
+
+  release:
+    name: 发布 Release
+    needs: [meta, build]
+    # tag 触发恒发版；手动触发看是否勾了 create_release。
+    #
+    # 注意「全有或全无」语义：build 是 matrix job，fail-fast: false 只保证
+    # 一个平台失败时其他平台**继续编完**（产物仍在 artifact 里可下载），
+    # 但 build 整体仍记为失败，于是本 job 被跳过、**不会发布残缺的 Release**。
+    # 这是刻意的：避免出现「只有 Windows 包的 v1.0.0」这种半成品发布。
+    # 若某平台确实修不了又想先发版：从 Actions 页面重跑失败的那个 matrix job，
+    # 或手动触发并用 target 只选能编过的平台。
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: artifacts
+          merge-multiple: true # 全部铺平到 artifacts/ 一层
+
+      - name: 生成 SHA256 校验文件
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          ls -lh
+          # nullglob：没有 .zip 时不要把字面量 "*.zip" 当文件名传给 sha256sum
+          shopt -s nullglob
+          files=(*.tar.gz *.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "✗ 没有找到任何压缩包产物" >&2
+            exit 1
+          fi
+          # 输出相对文件名，用户可直接 sha256sum -c SHA256SUMS.txt 校验
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 Release 并上传产物
+        # v2 已因 node20 退役停止维护（官方 README 明示 v2.6.2 为 v2 最后一版），这里用 v3
+        uses: softprops/action-gh-release@v3
+        with:
+          # 必须显式传 tag_name：手动触发时 github.ref_name 是分支名，
+          # 不传会拿分支名去建 tag
+          tag_name: v${{ needs.meta.outputs.version }}
+          name: v${{ needs.meta.outputs.version }}
+          draft: false # 直接发布，不留草稿
+          # 手动触发且没填版本号时产出的是 x.y.z-dev.<sha> 临时包，标为预发布，
+          # 不会顶掉仓库首页的 "Latest release"
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true # 由 GitHub 按提交/PR 自动生成变更说明
+          # fail_on_unmatched_files 对**每一条** glob 分别判定：任意一条匹配不到就失败。
+          # 手动触发时若只选了单个平台（如只编 linux-x86_64），就不会有 .zip，
+          # 分开写 *.tar.gz / *.zip 会让这一步在产物其实都正常的情况下失败。
+          # 所以用一条 glob 同时覆盖两种压缩包；"至少有一个包" 已由上游
+          # 「生成 SHA256 校验文件」步骤的 files[] 空数组检查兜住。
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/remotecontrol-*.*
+            artifacts/SHA256SUMS.txt

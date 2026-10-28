@@ -1,0 +1,187 @@
+# CI 校验：PR 与推送到主分支时跑格式化 / clippy / 测试 / 编译检查
+#
+# 说明：
+# - Linux 用 ubuntu-22.04（glibc 2.35）而非 ubuntu-latest，和 release.yml 保持同一基线，
+#   避免「CI 过了、发布包在老发行版跑不起来」这类错位。
+# - openh264 走 vendor/openh264-sys2 的 `source` feature，会用 cc 编译 upstream 的 C++ 源码，
+#   因此 runner 必须有 C++ 工具链（GitHub 镜像自带 gcc/g++、MSVC）。
+# - nasm 只在 x86/x86_64 下被 build.rs 使用；装不上时 build.rs 会静默降级为纯 C 实现，
+#   不会导致构建失败，但编码性能会下降，所以这里显式安装。
+name: CI
+
+on:
+  push:
+    branches: [dev-windows, main, master]
+  pull_request:
+    branches: [dev-windows, main, master]
+  # 允许手动触发，便于改完 workflow 立即验证
+  workflow_dispatch:
+
+# 同一分支的新推送会取消上一次还在跑的 CI，省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 里出错时打印完整 backtrace，便于定位
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 格式检查单独成 job：不需要任何系统依赖，秒级出结果
+  #
+  # 刻意设为 continue-on-error（提示而非门禁）：维护者本地没有 Rust 环境，
+  # 格式问题无法在本地 `cargo fmt --all` 修掉。硬门禁会把所有 push/PR 一起卡死，
+  # 而格式问题本身不影响正确性。需要修格式时走下面的 fmt-fix job 拿 patch。
+  # 待仓库存量格式问题清零后，可删掉 continue-on-error 改回硬门禁。
+  fmt:
+    name: 格式检查 (cargo fmt，仅提示)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: cargo fmt --check（失败时打印需要调整的位置）
+        run: |
+          # --check 只列出差异不改文件；失败时再打印一次带上下文的 diff，
+          # 便于直接在 CI 日志里看清要改什么，而不是只看到一个红叉。
+          if ! cargo fmt --all -- --check; then
+            echo "::warning::代码格式与 rustfmt 不一致（不阻塞 CI）。需要修复时请手动运行 fmt-fix workflow 下载补丁。"
+            echo "----- 以下是 rustfmt 建议的完整差异 -----"
+            cargo fmt --all -- --check --verbose || true
+            exit 1
+          fi
+
+  # 手动触发的格式修复：跑 cargo fmt 后把改动打成 patch 上传为 artifact。
+  # 维护者本地无 Rust 环境，这是他拿到格式化结果的唯一途径。
+  # 刻意**不**直接 commit 回仓库：避免 CI 在用户未预期时改动他的分支。
+  # 用法：Actions → CI → Run workflow → 下载 fmt-patch → 本地 `git apply fmt.patch`
+  fmt-fix:
+    name: 生成格式修复补丁（手动）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: cargo fmt --all 并生成补丁
+        run: |
+          cargo fmt --all
+          if git diff --quiet; then
+            echo "代码格式已符合 rustfmt，无需修改。"
+            # 留一个说明文件，避免 upload-artifact 因无文件而报错
+            echo "无需格式化改动。" > fmt.patch
+          else
+            git diff > fmt.patch
+            echo "已生成格式修复补丁，受影响文件："
+            git diff --name-only
+          fi
+
+      - name: 上传补丁
+        uses: actions/upload-artifact@v7
+        with:
+          name: fmt-patch
+          path: fmt.patch
+          if-no-files-found: error
+          retention-days: 7
+
+  # Linux：clippy + 测试 + release 编译检查
+  linux:
+    name: Linux 校验 (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          # build-essential: openh264 的 C++ 源码编译
+          # nasm: openh264 x86_64 汇编优化（缺失只降级不报错，但性能差很多）
+          # libxkbcommon-dev: enigo 在 unix(非 macOS) 下无条件依赖 xkbcommon crate，
+          #                   该 crate 直接 #[link] 系统 libxkbcommon，缺失会在链接期报错
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            nasm \
+            libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      # 必须放在 toolchain 安装之后：缓存 key 依赖当前 rustc 版本
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64
+          # 已知局限：vendor/openh264-sys2 的 C++ 编译产物**不会**被这个 action 缓存。
+          # 原因（读过 rust-cache v2 的 save.ts/cleanup.ts/workspace.ts 确认）：
+          # 它在保存前会清理 target，只保留两类包的产物——
+          #   1) getPackagesOutsideWorkspaceRoot()：manifest 路径不在 workspace 根下的包；
+          #   2) cache-workspace-crates=true 时追加 `cargo metadata --no-deps` 的成员。
+          # 而 vendor/openh264-sys2 是「仓库内 path patch」：路径在根目录下（不满足 1），
+          # 又不在 [workspace].members 里（不满足 2），两边都不沾，
+          # 于是 target/release/build/openh264-sys2-<hash>/out 会被删掉。
+          # 所以这里不加 cache-workspace-crates（加了也没用，只会白存本 crate 的产物）。
+          # 缓存收益主要来自 249 个 Rust 依赖的下载与编译；openh264 的 C++ 每次重编，
+          # 若后续觉得太慢，可考虑把 vendor/ 移出 workspace 根或改用 actions/cache 全量缓存 target
+          # （后者需评估 10GB 仓库缓存上限）。
+
+      - name: cargo clippy
+        # 暂不加 -D warnings：本仓库此前没有 clippy 门禁，一次性全红会阻塞所有 PR。
+        # 这里只保证「能过编译 + 暴露 clippy 告警」；待存量告警清零后再改成：
+        #   cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets
+
+      - name: cargo test
+        # 单元测试均为纯逻辑（键位映射 / 滚轮步长 / 协议解析），不需要 X11 显示环境
+        run: cargo test --locked --workspace
+
+      # 这里**不**再跑 cargo build --release：
+      # clippy --all-targets 与 cargo test 已经完整编译并链接了全部代码，编译检查不缺；
+      # 而再加一次 release 构建会让 openh264 的 91 个 C++ 文件按 debug/release 各编一遍
+      # （build.rs 的产物不在 rust-cache 缓存范围内，见上），纯属浪费 CI 时长。
+      # 想在合版前验证 release 编译：手动跑一次 Release workflow（workflow_dispatch，
+      # 不打 tag 时只产出 artifact、不创建 Release）。
+
+  # Windows：MSVC 工具链下的编译 + 测试
+  windows:
+    name: Windows 校验 (x86_64-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 nasm
+        shell: pwsh
+        run: |
+          # Windows 镜像未预装 nasm；choco 包不会自动写 PATH，需手动追加
+          choco install nasm -y --no-progress
+          "$env:ProgramFiles\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+          # 同 linux job：openh264 的 C++ 产物不在此 action 的缓存范围内，见上面注释
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --locked --workspace
+        # 同 linux job：不额外跑 release 构建，避免 openh264 的 C++ 重复全量编译
