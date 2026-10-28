@@ -5,9 +5,14 @@ edition = "2021"
 description = "RemoteControl 被控端服务"
 
 [features]
-default = ["x11"]
+# 默认同时启用 x11 与 wayland：Linux 下的同一份二进制能在启动时
+# 通过 WAYLAND_DISPLAY / XDG_SESSION_TYPE 自动切到对应后端。
+default = ["x11", "wayland"]
 x11 = []
-wayland = []
+# Wayland 支持：当前实现以 Xwayland 作为桥接（复用 x11rb 与 XTest），
+# 因此启用 wayland 时自动带上 x11 编译单元；后续接入 PipeWire/portal 时
+# 会再拆分为独立后端。
+wayland = ["x11"]
 
 [dependencies]
 # Web 服务器 + 异步运行时
@@ -57,3 +62,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Windows 屏幕捕获（Desktop Duplication API）+ 输入注入（SendInput API）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",  # SendInput 精确滚轮控制
+    "Win32_UI_HiDpi",                    # DPI 感知
+]}

@@ -502,6 +502,28 @@ async fn handle_socket(mut socket: WebSocket, peer_addr: SocketAddr, state: Arc<
                     ClientMsg::ClipboardGet => {
                         handle_clipboard_get(&mut socket, peer_addr, &state).await;
                     }
+                    ClientMsg::SpecialKey { key } => {
+                        // 处理浏览器无法捕获的系统快捷键
+                        if injector.is_none() {
+                            match input::create_injector() {
+                                Ok(inj) => {
+                                    info!("{}: 输入注入器已就绪", peer_addr);
+                                    injector = Some(inj);
+                                }
+                                Err(e) => {
+                                    warn!("{}: 创建输入注入器失败: {}", peer_addr, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(inj) = injector.as_mut() {
+                            if let Err(e) = handle_special_key(inj.as_mut(), &key) {
+                                warn!("{}: 注入特殊快捷键 '{}' 失败: {}", peer_addr, key, e);
+                            } else {
+                                debug!("{}: 已注入特殊快捷键: {}", peer_addr, key);
+                            }
+                        }
+                    }
                     ClientMsg::Auth { .. } => {
                         debug!("{}: 已认证连接重复发送 auth，忽略", peer_addr);
                     }
@@ -726,6 +748,55 @@ fn norm_to_pixel(x: f64, y: f64, screen_width: i32, screen_height: i32) -> (i32,
     let py = (ny * f64::from(screen_height)).round() as i32;
     (px, py)
 }
+
+/// 处理特殊快捷键组合（浏览器无法捕获的系统键）。
+///
+/// 按下所有修饰键 → 按下目标键 → 释放目标键 → 释放修饰键，模拟用户按下组合键。
+fn handle_special_key(injector: &mut dyn InputInjector, key: &str) -> Result<()> {
+    match key {
+        "alt_f4" => {
+            // 模拟 Alt+F4：关闭当前窗口
+            injector.key("AltLeft", true)?;
+            injector.key("F4", true)?;
+            injector.key("F4", false)?;
+            injector.key("AltLeft", false)?;
+            Ok(())
+        }
+        "ctrl_alt_del" => {
+            // 模拟 Ctrl+Alt+Del：Windows 安全屏幕
+            // 注意：在 Windows 上，SendInput 无法模拟 Ctrl+Alt+Del（系统安全限制）
+            // 需要驱动级注入或专门的 API（如 SAS generation）
+            injector.key("ControlLeft", true)?;
+            injector.key("AltLeft", true)?;
+            injector.key("Delete", true)?;
+            injector.key("Delete", false)?;
+            injector.key("AltLeft", false)?;
+            injector.key("ControlLeft", false)?;
+            Ok(())
+        }
+        "win_d" => {
+            // Windows+D：显示桌面
+            injector.key("MetaLeft", true)?;
+            injector.key("KeyD", true)?;
+            injector.key("KeyD", false)?;
+            injector.key("MetaLeft", false)?;
+            Ok(())
+        }
+        "win_l" => {
+            // Windows+L：锁定计算机
+            injector.key("MetaLeft", true)?;
+            injector.key("KeyL", true)?;
+            injector.key("KeyL", false)?;
+            injector.key("MetaLeft", false)?;
+            Ok(())
+        }
+        other => {
+            debug!("未支持的特殊快捷键 '{}'，忽略", other);
+            Ok(())
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

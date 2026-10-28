@@ -44,34 +44,55 @@ pub trait ScreenCapturer: Send {
 }
 
 /// 工厂函数：创建当前平台的捕获器实现
+///
+/// Linux 下的选择逻辑：
+/// - 同时启用 `wayland` + `x11` feature 时，通过 `WAYLAND_DISPLAY` 环境变量
+///   判断当前是否为 Wayland 会话，是则走 `WaylandCapturer`，否则走 `X11Capturer`。
+/// - 只启用 `wayland`：一律走 Wayland 后端（内部仍依赖 Xwayland 桥接）。
+/// - 只启用 `x11`：走原 `X11Capturer`。
 pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
-    #[cfg(all(target_os = "linux", feature = "x11"))]
+    #[cfg(target_os = "windows")]
+    {
+        let capturer = windows::WindowsCapturer::new()?;
+        return Ok(Box::new(capturer));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    {
+        // Wayland 会话优先走 Wayland 后端；纯 X11 会话降级到 X11Capturer。
+        if is_wayland_session() {
+            let capturer = wayland::WaylandCapturer::new()?;
+            return Ok(Box::new(capturer));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "x11", feature = "wayland")))]
     {
         let capturer = x11::X11Capturer::new()?;
         return Ok(Box::new(capturer));
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        anyhow::bail!("Windows 屏幕捕获将在后续里程碑实现")
-    }
-
-    #[cfg(all(target_os = "linux", feature = "wayland"))]
-    {
-        anyhow::bail!("Wayland 屏幕捕获将在后续里程碑实现")
-    }
-
     #[cfg(not(any(
-        all(target_os = "linux", feature = "x11"),
         target_os = "windows",
-        all(target_os = "linux", feature = "wayland")
+        all(target_os = "linux", any(feature = "x11", feature = "wayland")),
     )))]
     {
         anyhow::bail!("当前平台不支持屏幕捕获")
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "x11"))]
+/// 判断当前是否运行在 Wayland 会话中。
+///
+/// 判定顺序：`WAYLAND_DISPLAY` 非空 > `XDG_SESSION_TYPE == "wayland"`。
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+fn is_wayland_session() -> bool {
+    if std::env::var("WAYLAND_DISPLAY").ok().filter(|v| !v.is_empty()).is_some() {
+        return true;
+    }
+    matches!(std::env::var("XDG_SESSION_TYPE").as_deref(), Ok("wayland"))
+}
+
+#[cfg(all(target_os = "linux", any(feature = "x11", feature = "wayland")))]
 mod x11;
 
 #[cfg(target_os = "windows")]
