@@ -90,12 +90,16 @@ fn generate_self_signed() -> Result<(String, String)> {
         .context("创建证书参数失败")?;
 
     // 添加 SAN: IP 127.0.0.1
-    params.subject_alt_names.push(SanType::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-    ));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
 
     let key_pair = KeyPair::generate().context("生成密钥对失败")?;
-    let cert = params.self_signed(&key_pair).context("生成自签名证书失败")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("生成自签名证书失败")?;
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();

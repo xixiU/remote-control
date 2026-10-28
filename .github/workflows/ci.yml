@@ -33,10 +33,21 @@ env:
 jobs:
   # 格式检查单独成 job：不需要任何系统依赖，秒级出结果
   #
-  # 刻意设为 continue-on-error（提示而非门禁）：维护者本地没有 Rust 环境，
-  # 格式问题无法在本地 `cargo fmt --all` 修掉。硬门禁会把所有 push/PR 一起卡死，
-  # 而格式问题本身不影响正确性。需要修格式时走下面的 fmt-fix job 拿 patch。
-  # 待仓库存量格式问题清零后，可删掉 continue-on-error 改回硬门禁。
+  # 暂时仍是 continue-on-error（提示而非门禁），原因不是「格式不重要」，
+  # 而是**存量还没清零**，现在合上门禁会把所有 push/PR 一起卡死：
+  #   1) rustfmt 不认 #[cfg]，它按 `mod` 声明遍历源码树。capture/mod.rs 与
+  #      input/mod.rs 里都有 `#[cfg(target_os = "windows")] mod windows;`，
+  #      所以 ubuntu runner 上 `cargo fmt --all -- --check` 照样会检查
+  #      capture/windows.rs、input/windows.rs。
+  #   2) 已人工清零的只有 tls.rs 和 web.rs；capture/windows.rs、encoder.rs、
+  #      main.rs、pipeline.rs、web.rs:251、capture/mod.rs、input/mod.rs 里
+  #      还有十几处真实的待格式化代码（表达式、函数签名、宏参数、可合并的
+  #      方法链），不是 rustfmt 无法折行的长字符串。
+  #
+  # 关门步骤（顺序不能反）：
+  #   a) Actions → CI → Run workflow 手动触发一次，下载 fmt-patch artifact
+  #   b) 本地 `git apply fmt.patch` 并提交——这是权威的格式化结果
+  #   c) 存量真正清零后，删掉下面的 continue-on-error，改成硬门禁
   fmt:
     name: 格式检查 (cargo fmt，仅提示)
     runs-on: ubuntu-22.04
@@ -54,16 +65,34 @@ jobs:
           # --check 只列出差异不改文件；失败时再打印一次带上下文的 diff，
           # 便于直接在 CI 日志里看清要改什么，而不是只看到一个红叉。
           if ! cargo fmt --all -- --check; then
-            echo "::warning::代码格式与 rustfmt 不一致（不阻塞 CI）。需要修复时请手动运行 fmt-fix workflow 下载补丁。"
+            echo "::warning::代码格式与 rustfmt 不一致（暂不阻塞 CI，存量清零后会改成硬门禁）。"
             echo "----- 以下是 rustfmt 建议的完整差异 -----"
             cargo fmt --all -- --check --verbose || true
-            exit 1
+            echo "----- 如何修复 -----"
+            echo "本地有 Rust 环境：直接运行 cargo fmt --all"
+            echo "本地没有 Rust 环境：Actions → CI → Run workflow 手动触发，"
+            echo "  下载 fmt-patch artifact，解压后执行 git apply fmt.patch"
+            # 刻意**不** exit 1：continue-on-error 只是不阻塞下游 job，
+            # 并不会改变本 step 的退出码——GitHub 依然画红叉并打 error 注解，
+            # 看起来跟真失败一模一样。既然这个阶段定位是「提示」，就让它退 0，
+            # 靠上面的 ::warning:: 出黄色提示。存量清零后再改回 exit 1 做硬门禁。
           fi
 
   # 手动触发的格式修复：跑 cargo fmt 后把改动打成 patch 上传为 artifact。
   # 维护者本地无 Rust 环境，这是他拿到格式化结果的唯一途径。
   # 刻意**不**直接 commit 回仓库：避免 CI 在用户未预期时改动他的分支。
   # 用法：Actions → CI → Run workflow → 下载 fmt-patch → 本地 `git apply fmt.patch`
+  #
+  # 换行符说明（补丁在 ubuntu 生成、在 Windows 应用，实测结论）：
+  # 本仓库没有 .gitattributes，且所有 .rs/.yml 在 index 里都是 LF（git ls-files --eol
+  # 显示 i/lf），所以 runner 上 checkout 出来是 LF，git diff 生成的也是纯 LF 补丁。
+  # git apply 的 hunk 匹配走 index 里的 blob 而非工作区字节，因此即使 Windows 侧
+  # core.autocrlf=true 把工作区检出成 CRLF（w/crlf），LF 补丁依然能干净应用——
+  # 已用 core.autocrlf=input 与 =true 两种克隆实测通过。
+  # 真正会失败的只有「index 里存成 CRLF」的情况（例如将来加了 `-text` 或
+  # `eol=crlf` 的 .gitattributes，使 blob 带 CR），那时 LF 补丁会报
+  # "patch does not apply"，补救办法是 `git apply --ignore-whitespace fmt.patch`。
+  # 结论：当前配置下无需额外参数；若哪天真遇到上述报错，先加 --ignore-whitespace。
   fmt-fix:
     name: 生成格式修复补丁（手动）
     if: github.event_name == 'workflow_dispatch'

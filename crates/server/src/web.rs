@@ -15,13 +15,13 @@ use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 use tracing::{debug, info, warn};
 
+use crate::capture::{CursorShape, ScreenInfo};
+use crate::clipboard;
 use crate::config::AppConfig;
 use crate::input::{self, InputInjector, MouseButton};
 use crate::pipeline::CaptureEncoder;
 use crate::protocol::{parse_client_msg, ClientMsg, ServerMsg};
-use crate::session::{Authenticator, AuthState, BruteForceGuard, Session};
-use crate::clipboard;
-use crate::capture::{CursorShape, ScreenInfo};
+use crate::session::{AuthState, Authenticator, BruteForceGuard, Session};
 
 /// 认证失败时固定延迟回复，削弱时序侧信道并拖慢爆破（见 docs/04 第 4 节）。
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(800);
@@ -72,15 +72,9 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
     } else {
         config.video.bitrate * 1_000_000
     };
-    let (pipeline, screen_info) = CaptureEncoder::new(
-        config.video.fps,
-        bitrate_bps,
-    )?;
-    let (video_tx, keyframe_tx, mut screen_info_rx, cursor_tx) = pipeline.start(
-        config.video.fps,
-        bitrate_bps,
-        8,
-    );
+    let (pipeline, screen_info) = CaptureEncoder::new(config.video.fps, bitrate_bps)?;
+    let (video_tx, keyframe_tx, mut screen_info_rx, cursor_tx) =
+        pipeline.start(config.video.fps, bitrate_bps, 8);
 
     info!("视频流已启动: {}x{}", screen_info.width, screen_info.height);
 
@@ -143,7 +137,10 @@ pub async fn serve(config: AppConfig, authenticator: Authenticator) -> Result<()
             .await?;
     } else {
         let listener = TcpListener::bind(&bind).await?;
-        info!("HTTP 服务已启动: http://{}（TLS 未启用，仅限开发环境）", bind);
+        info!(
+            "HTTP 服务已启动: http://{}（TLS 未启用，仅限开发环境）",
+            bind
+        );
 
         axum::serve(
             listener,
@@ -796,7 +793,6 @@ fn handle_special_key(injector: &mut dyn InputInjector, key: &str) -> Result<()>
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
