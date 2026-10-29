@@ -266,3 +266,31 @@ body.in-control .control-surface:focus {
 .drawer-btn:active {
     background: rgba(0, 212, 255, 0.28);
 }
+
+/* 自动剪切板关闭时按钮置灰，和"开"状态一眼可分。 */
+.drawer-btn[data-off="1"] {
+    color: #888;
+    background: rgba(255, 255, 255, 0.03);
+    border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* 剪切板同步提示：右下角浮层。剪切板内容可能含密码，每次自动同步都要让用户看见方向。 */
+.clip-toast {
+    position: fixed;
+    right: 1rem;
+    bottom: 1rem;
+    z-index: 1000;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    color: #eee;
+    background: rgba(0, 0, 0, 0.75);
+    border: 1px solid rgba(0, 212, 255, 0.4);
+    border-radius: 6px;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+.clip-toast[data-state="fail"] {
+    border-color: rgba(239, 83, 80, 0.6);
+    color: #ef9a9a;
+}

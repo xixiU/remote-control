@@ -38,6 +38,9 @@
         </div>
     </div>
 
+    <!-- 剪切板同步浮层提示：抽屉收起时也能看到同步方向，避免剪切板在用户无感知下被传走 -->
+    <div class="clip-toast" id="clip-toast" role="status" aria-live="polite" hidden></div>
+
     <!-- 顶部悬浮抽屉：鼠标移到顶部细条上展开 -->
     <div class="top-drawer" id="top-drawer" hidden>
         <div class="drawer-trigger" aria-hidden="true"></div>
@@ -46,8 +49,24 @@
             <button type="button" id="btn-toggle-fullscreen" class="drawer-btn">全屏</button>
             <button type="button" id="btn-send-alt-f4" class="drawer-btn">Alt+F4</button>
             <button type="button" id="btn-send-ctrl-alt-del" class="drawer-btn">Ctrl+Alt+Del</button>
-            <button type="button" id="btn-send-clipboard" class="drawer-btn">传输本地剪切板</button>
-            <button type="button" id="btn-read-clipboard" class="drawer-btn">读取远端剪切板</button>
+            <button
+                type="button"
+                id="btn-auto-clipboard"
+                class="drawer-btn"
+                title="开启后在画面内按 Ctrl+C / Ctrl+V 自动同步剪切板，方向由按键决定。右键菜单复制请用「读取远端剪切板」。"
+            >自动剪切板：开</button>
+            <button
+                type="button"
+                id="btn-send-clipboard"
+                class="drawer-btn"
+                title="把本地剪切板推到被控端。自动同步开启时按 Ctrl+V 即可，无需点此。"
+            >传输本地剪切板</button>
+            <button
+                type="button"
+                id="btn-read-clipboard"
+                class="drawer-btn"
+                title="从被控端取剪切板。在远程桌面用右键菜单复制、或远程程序自己写了剪切板时，点这里取回。"
+            >读取远端剪切板</button>
         </div>
     </div>
 

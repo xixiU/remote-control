@@ -34,7 +34,17 @@ pub enum ServerMsg {
     /// 通用错误。
     Error { code: String, message: String },
     /// 远端剪切板内容（响应客户端的 clipboard_get）。
-    ClipboardData { text: String },
+    ClipboardData {
+        text: String,
+        /// 本次内容的指纹，客户端存下来用于下次请求时比对。
+        #[serde(default)]
+        fingerprint: String,
+    },
+    /// 被控端剪切板与客户端持有的内容一致，正文未重传。
+    ///
+    /// 只在客户端的 `clipboard_get` 带了匹配的 fingerprint 时发送，
+    /// 用来省掉轮询重试中的重复下载。
+    ClipboardUnchanged,
     /// 剪切板操作失败（区别于通用 Error，便于前端按按钮反馈）。
     /// `op` 取 "get" / "set"，方便客户端定位是哪边失败。
     ClipboardError { op: String, message: String },
@@ -93,7 +103,16 @@ pub enum ClientMsg {
         text: String,
     },
     /// 请求被控端剪切板文本，服务端以 `ClipboardData` 回复。
-    ClipboardGet,
+    ClipboardGet {
+        /// 客户端已持有内容的指纹（见 `ClipboardData::fingerprint`）。
+        ///
+        /// 带上它时，若被控端剪切板内容未变，服务端只回
+        /// `ClipboardUnchanged` 而不重传正文 —— 自动同步要轮询等复制动作
+        /// 落地，重试几次就把同一份文本重复下载几遍，公网小带宽下会挤掉视频流。
+        /// 空字符串表示客户端没有可比对的内容，正常返回全文。
+        #[serde(default)]
+        fingerprint: String,
+    },
     /// 发送特殊快捷键组合（浏览器无法捕获的系统键）。
     SpecialKey {
         /// 快捷键标识："alt_f4" / "ctrl_alt_del" 等。
@@ -110,6 +129,20 @@ impl ServerMsg {
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
     }
+}
+
+/// 算一段剪切板文本的指纹，用于判断"内容有没有变"。
+///
+/// 用标准库 hasher 而非引入 sha2：这里只需要在一次会话内比对两段文本是否相同，
+/// 不是安全场景，不需要抗碰撞。`DefaultHasher` 不保证跨 Rust 版本稳定，
+/// 但指纹由服务端生成、客户端原样回传、再由同一进程比对，不跨版本流转。
+///
+/// 带上长度一起输出，让碰撞也要同时撞长度，进一步降低误判概率。
+pub fn clipboard_fingerprint(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:x}-{:x}", text.len(), hasher.finish())
 }
 
 /// 从文本解析浏览器消息。解析失败时返回错误，由调用方决定处理（M1 仅记日志）。
@@ -295,16 +328,35 @@ mod tests {
             }
         );
 
+        // 不带 fingerprint 的老客户端消息仍能解析（serde(default) 兜底）。
         let get = parse_client_msg(r#"{"type":"clipboard_get"}"#).unwrap();
-        assert_eq!(get, ClientMsg::ClipboardGet);
+        assert_eq!(
+            get,
+            ClientMsg::ClipboardGet {
+                fingerprint: String::new()
+            }
+        );
+
+        let get_fp = parse_client_msg(r#"{"type":"clipboard_get","fingerprint":"5-abc"}"#).unwrap();
+        assert_eq!(
+            get_fp,
+            ClientMsg::ClipboardGet {
+                fingerprint: "5-abc".to_string()
+            }
+        );
 
         let data = ServerMsg::ClipboardData {
             text: "world".to_string(),
+            fingerprint: clipboard_fingerprint("world"),
         }
         .to_json()
         .unwrap();
         assert!(data.contains("\"type\":\"clipboard_data\""));
         assert!(data.contains("\"text\":\"world\""));
+        assert!(data.contains("\"fingerprint\":"));
+
+        let unchanged = ServerMsg::ClipboardUnchanged.to_json().unwrap();
+        assert!(unchanged.contains("\"type\":\"clipboard_unchanged\""));
 
         let err = ServerMsg::ClipboardError {
             op: "set".to_string(),
@@ -314,6 +366,17 @@ mod tests {
         .unwrap();
         assert!(err.contains("\"type\":\"clipboard_error\""));
         assert!(err.contains("\"op\":\"set\""));
+    }
+
+    #[test]
+    fn clipboard_fingerprint_distinguishes_content() {
+        // 同内容同指纹，是"未变则不重传"的前提。
+        assert_eq!(clipboard_fingerprint("hello"), clipboard_fingerprint("hello"));
+        assert_ne!(clipboard_fingerprint("hello"), clipboard_fingerprint("world"));
+        // 等长不同内容也要能区分（指纹不是只看长度）。
+        assert_ne!(clipboard_fingerprint("aaaa"), clipboard_fingerprint("bbbb"));
+        // 空内容也有稳定指纹，但客户端用空串表示"没有可比对内容"，二者不冲突。
+        assert!(!clipboard_fingerprint("").is_empty());
     }
 
     #[test]

@@ -18,6 +18,8 @@ const btnSendAltF4El = document.getElementById('btn-send-alt-f4');
 const btnSendCtrlAltDelEl = document.getElementById('btn-send-ctrl-alt-del');
 const btnSendClipboardEl = document.getElementById('btn-send-clipboard');
 const btnReadClipboardEl = document.getElementById('btn-read-clipboard');
+const btnAutoClipboardEl = document.getElementById('btn-auto-clipboard');
+const clipToastEl = document.getElementById('clip-toast');
 
 let ws = null;
 let helloReceived = false;
@@ -42,6 +44,64 @@ let keyFrameDecoded = false; // 在收到首个关键帧前，丢弃所有 P 帧
 const MOVE_THROTTLE_MS = 16;
 let lastMoveSentAt = 0;
 let pendingMove = null;
+
+// 已发出 key_down、尚未发出 key_up 的 KeyboardEvent.code 集合。
+//
+// 浏览器会永久丢掉某些 keyup：最典型的是按住 Alt 再按 Tab —— Alt+Tab 被操作系统
+// 当系统快捷键吞掉，页面只收到 blur，Alt 的 keyup 永远不来。被控端于是残留一个
+// 按下的 Alt，之后每个普通键都变成 Alt+X 被菜单吃掉，用户看到的就是
+// 「键盘被锁定，要在本地敲一下 Alt 才能继续输入」。
+// 记账后可在失焦 / 页面隐藏 / 断连前补发释放。
+const pressedKeys = new Set();
+// 已发出 mouse_down、尚未发出 mouse_up 的按键名。
+// 同理会丢：在画面上按住左键拖拽，拖出浏览器窗口再松手，mouse_up 落不到页面上，
+// 被控端就留着一个按下的左键（表现为「鼠标一直在框选/拖拽」）。
+const pressedButtons = new Set();
+
+// ========== 自动剪切板同步状态 ==========
+//
+// 方向由用户的按键手势决定，不猜测光标位置：
+//   画面内 Ctrl+C/X → 透传按键，再轮询被控端剪切板，拉回本地（远端 → 本地）
+//   画面内 Ctrl+V   → 先把本地剪切板推给被控端，再补发 Ctrl+V（本地 → 远端）
+// 只在这两个明确手势下触发，不做失焦/划过画面的隐式同步：那既受浏览器手势限制，
+// 又会让用户在毫无感知的情况下把剪切板（可能含密码）发到被控端。
+let autoClipboard = true;
+
+// 回环去重：记下最近一次"两端已一致"的文本。
+// 推上去的内容再被拉回来时与它相同，就不再写回本地，断开 A→B→A 的循环。
+let lastSyncedText = null;
+// 服务端为 lastSyncedText 算的指纹。随 clipboard_get 带上去，
+// 内容没变时服务端只回 clipboard_unchanged，不重传正文 —— 公网带宽很窄
+// （用户的服务器只有 3 Mbps），轮询重试重复下载同一份文本会挤掉视频流。
+let lastSyncedFingerprint = '';
+
+// Ctrl+V 待处理标记：keydown 里置位，paste 事件里消费。
+let pendingPaste = null;
+// paste 事件迟迟不来时的兜底定时器。
+let pasteFallbackTimer = null;
+// Ctrl+V 的 keydown 被延后注入，对应 keyup 要跳过，靠这个标记。
+let pasteKeyIntercepted = false;
+// 远端剪切板轮询定时器，用于取消上一轮未完成的拉取。
+let pullTimer = null;
+// 本轮还剩几次重试。
+let pullRetriesLeft = 0;
+// 右键提示每次连接只弹一次，避免每右键一下都弹。
+let rightClickHintShown = false;
+// 在途的 clipboard_get 是自动轮询发的（true）还是手动按钮发的（false）。
+// 服务端对两者回同一个 clipboard_data，靠这个标记分流，不新增协议消息。
+let autoPullPending = false;
+
+// 复制动作在被控端生效需要时间，首次拉取前先等一会儿。
+const PULL_FIRST_DELAY_MS = 120;
+// 拉到的还是旧内容时的重试间隔与次数。
+// 总耗时 120 + 4*180 = 840ms，远小于 transient activation 的 ~5s 窗口，
+// 保证最后的 writeText() 仍在 Ctrl+C 这次手势的授权范围内。
+const PULL_RETRY_DELAY_MS = 180;
+const PULL_MAX_RETRIES = 4;
+// paste 事件兜底等待。
+const PASTE_EVENT_TIMEOUT_MS = 300;
+// 与服务端 ClipboardConfig.max_text_bytes 默认值一致，超限就不白跑一趟 WebSocket。
+const CLIP_MAX_BYTES = 1024 * 1024;
 
 // 设置状态文案与颜色（state: idle / connecting / ok / fail）。
 function setStatus(text, state) {
@@ -92,6 +152,10 @@ function connect() {
     };
 
     ws.onclose = () => {
+        // 连接已断，release_all 发不出去了，只清本地记账避免重连后状态错乱；
+        // 被控端的残留按键由服务端在连接结束时兜底释放（见 web.rs release_all）。
+        pressedKeys.clear();
+        pressedButtons.clear();
         if (manualClose) {
             // 用户主动断开：状态已由 backToLogin() 设置，这里不再覆盖。
             manualClose = false;
@@ -138,6 +202,12 @@ function handleMessage(msg) {
             controlPanelEl.hidden = false;
             bindInputCapture();
             enterControlMode();
+            // 新会话重置剪切板同步状态：换了被控端还沿用旧指纹，会让服务端
+            // 误判"内容未变"而不下发正文。右键提示也重新给一次。
+            lastSyncedText = null;
+            lastSyncedFingerprint = '';
+            rightClickHintShown = false;
+            cancelPendingClipboardSync();
             // 自动聚焦到输入区，方便立刻接收键盘事件。
             surfaceEl.focus();
             break;
@@ -150,15 +220,42 @@ function handleMessage(msg) {
             hintEl.textContent = `${msg.code}: ${msg.message}`;
             break;
         case 'clipboard_data':
-            // 远端剪切板内容到达，写入本地浏览器剪切板。
-            applyRemoteClipboard(msg.text || '');
+            // 远端剪切板内容到达。自动轮询和手动按钮用的是同一个请求/响应，
+            // 靠 autoPullPending 区分，避免为此新增协议消息类型。
+            if (autoPullPending) {
+                autoPullPending = false;
+                onAutoClipboardData(msg.text || '', msg.fingerprint || '');
+            } else {
+                applyRemoteClipboard(msg.text || '', msg.fingerprint || '');
+            }
+            break;
+        case 'clipboard_unchanged':
+            // 被控端内容与本地已持有的一致，服务端没重传正文（省带宽）。
+            // 自动轮询下继续等复制动作落地；手动按钮下直接告诉用户无变化。
+            if (autoPullPending) {
+                autoPullPending = false;
+                retryPullOrGiveUp();
+            } else {
+                flashButton(btnReadClipboardEl, '内容无变化');
+            }
             break;
         case 'clipboard_error':
             console.warn('剪切板操作失败:', msg.op, msg.message);
             if (msg.op === 'get') {
-                flashButton(btnReadClipboardEl, '远端失败');
+                if (autoPullPending) {
+                    // 自动轮询失败：清掉在途标记并停止重试，否则会一直空转。
+                    autoPullPending = false;
+                    pullRetriesLeft = 0;
+                    clearTimeout(pullTimer);
+                    showClipToast(`取回失败：${msg.message}`, 'fail');
+                } else {
+                    flashButton(btnReadClipboardEl, '远端失败');
+                }
             } else if (msg.op === 'set') {
                 flashButton(btnSendClipboardEl, '远端失败');
+                if (autoClipboard) {
+                    showClipToast(`同步失败：${msg.message}`, 'fail');
+                }
             }
             break;
         case 'pong':
@@ -269,6 +366,7 @@ function onMouseDown(ev) {
     if (!btn) return;
     surfaceEl.focus();
     const { x, y } = normalizedFromMouse(ev);
+    pressedButtons.add(btn);
     sendInput({ event: 'mouse_down', button: btn, x, y });
     ev.preventDefault();
 }
@@ -277,6 +375,7 @@ function onMouseUp(ev) {
     const btn = buttonName(ev.button);
     if (!btn) return;
     const { x, y } = normalizedFromMouse(ev);
+    pressedButtons.delete(btn);
     sendInput({ event: 'mouse_up', button: btn, x, y });
     ev.preventDefault();
 }
@@ -295,23 +394,94 @@ function onWheel(ev) {
     ev.preventDefault();
 }
 
+/// 当前是否该采集键盘。监听挂在 window 上，所以必须自己判断：
+/// 退回登录界面后控制面板隐藏，此时按键属于密码框，不能透传更不能 preventDefault，
+/// 否则密码根本打不进去。
+function keyboardCaptureActive() {
+    return !controlPanelEl.hidden;
+}
+
 function onKeyDown(ev) {
+    if (!keyboardCaptureActive()) return;
+    const clipAction = clipboardActionOf(ev);
+
+    if (clipAction === 'paste') {
+        // 粘贴键先不透传：被控端必须先拿到本地剪切板内容，再执行 Ctrl+V，
+        // 否则粘出来的是被控端的旧剪切板。真正的 V 注入延后到 onPaste 里补发。
+        //
+        // 关键：这里不能 preventDefault，否则浏览器不会生成 paste 事件。
+        // paste 事件内读 clipboardData 是唯一无需权限、不弹授权浮层的本地剪切板读取路径
+        // （readText() 在 Firefox/Safari 必弹 Paste 浮层，在 Chromium 需 clipboard-read 授权）。
+        pendingPaste = { at: performance.now() };
+        // 置位让 onKeyUp 跳过这枚 V 的释放；V 不进 pressedKeys，
+        // 因为它还没被注入过，不需要失焦时的补释放。
+        pasteKeyIntercepted = true;
+        // 兜底：若 paste 事件没来（浏览器差异），到时按普通按键把 V 透传出去，
+        // 至少退化成被控端本地粘贴，不吞按键。
+        clearTimeout(pasteFallbackTimer);
+        pasteFallbackTimer = setTimeout(() => {
+            if (!pendingPaste) return;
+            pendingPaste = null;
+            console.warn('paste 事件未触发，退化为直接透传 Ctrl+V');
+            sendClipKey();
+            showClipToast('粘贴：未读到本地剪切板', 'fail');
+        }, PASTE_EVENT_TIMEOUT_MS);
+        return;
+    }
+
+    pressedKeys.add(ev.code);
     sendInput({
         event: 'key_down',
         code: ev.code,
         modifiers: modifiersFromEvent(ev),
     });
+
+    if (clipAction === 'copy') {
+        // 复制键已透传，稍后轮询远端剪切板拉回本地。
+        // 这里照常 preventDefault：我们不需要浏览器的 copy 事件，
+        // 且放行 default 有可能让空选区的复制动作清空本地剪切板。
+        // preventDefault 不会取消 keydown 带来的 transient activation
+        // （MDN User_activation：activation 在事件派发时记录），
+        // 所以稍后的 writeText() 仍在手势窗口内。
+        schedulePullRemoteClipboard();
+    }
+
     // 阻止浏览器自身处理（如 Ctrl+S 弹保存），让按键专注于注入。
     ev.preventDefault();
 }
 
 function onKeyUp(ev) {
+    if (!keyboardCaptureActive()) return;
+    // Ctrl+V 的 keydown 被延后注入了，对应的 keyup 也要跳过，
+    // 否则被控端会收到一个没有配对按下的 V 释放。
+    // 修饰键（Ctrl）的 keyup 照常透传，由 sendClipKey 自己管 V 的按下/释放。
+    if (ev.code === 'KeyV' && pasteKeyIntercepted) {
+        pasteKeyIntercepted = false;
+        return;
+    }
+    pressedKeys.delete(ev.code);
     sendInput({
         event: 'key_up',
         code: ev.code,
         modifiers: modifiersFromEvent(ev),
     });
     ev.preventDefault();
+}
+
+/// 让被控端释放所有按键，并清空本地记账。
+///
+/// 浏览器丢 keyup 的场景（见 pressedKeys 注释）一旦发生，被控端会残留按下的
+/// 修饰键，表现为「键盘被锁定」。失焦 / 页面隐藏 / 断连前都要调用这里兜底。
+/// 服务端自己记着按下集合，一条 release_all 即可，无需逐个补 key_up。
+function releaseAllKeys() {
+    // 失焦/断连时丢掉在途的剪切板同步：兜底定时器若在用户切走之后才触发，
+    // 会往被控端补发一枚没有上下文的 Ctrl+V；轮询也不该在断连后继续。
+    cancelPendingClipboardSync();
+
+    if (pressedKeys.size === 0 && pressedButtons.size === 0) return;
+    pressedKeys.clear();
+    pressedButtons.clear();
+    sendInput({ event: 'release_all' });
 }
 
 function bindInputCapture() {
@@ -323,11 +493,36 @@ function bindInputCapture() {
     surfaceEl.addEventListener('mouseup', onMouseUp);
     surfaceEl.addEventListener('wheel', onWheel, { passive: false });
     // 屏蔽右键菜单，让 right-click 能透传。
-    surfaceEl.addEventListener('contextmenu', (e) => e.preventDefault());
+    surfaceEl.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        // 右键菜单里最可能点的就是复制/粘贴，但那条路径不经过键盘事件，
+        // 前端无从得知，所以这里只提示兜底方式，不自动拉取。
+        // 不自动拉的原因见 maybeHintRightClickCopy 注释。
+        maybeHintRightClickCopy();
+    });
 
-    // 键盘事件挂在控制区上，需要焦点。
-    surfaceEl.addEventListener('keydown', onKeyDown);
-    surfaceEl.addEventListener('keyup', onKeyUp);
+    // 键盘事件挂在 window 上而非控制区：挂在 surface 上时，一旦它失去焦点
+    // （点到顶部抽屉按钮、浏览器 UI、系统对话框）就收不到 keyup，
+    // 被控端会残留按下的修饰键。window 级监听覆盖页面内任意焦点位置。
+    // 用捕获阶段，避免被其它元素的处理器提前 stopPropagation。
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+
+    // 窗口失焦：Alt+Tab 这类系统快捷键会让 keyup 彻底丢失，必须补发释放。
+    window.addEventListener('blur', releaseAllKeys);
+    // 标签页切到后台：部分平台不触发 blur，单独兜一道。
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') releaseAllKeys();
+    });
+    // 关闭/刷新页面前释放。pagehide 比 unload 可靠（支持页面缓存场景）。
+    window.addEventListener('pagehide', releaseAllKeys);
+
+    // 自动剪切板：paste 事件挂在 window 捕获阶段，和键盘监听保持一致。
+    // 画面区是 canvas（不可编辑），paste 的 target 会落到 body 之类的元素上，
+    // 所以不能挂在 surfaceEl 上，必须用冒泡到 window 的全局监听。
+    window.addEventListener('paste', onPaste, true);
+
+    syncAutoClipboardLabel();
 
     const hint = '已就绪：移动/点击鼠标、按键将注入被控端。';
     const lockHint = navigator.keyboard && navigator.keyboard.lock
@@ -529,6 +724,9 @@ function exitControlMode() {
 
 /// 关闭 WebSocket 并退回登录界面。
 function backToLogin() {
+    // 先释放残留按键再关连接：连接关掉后 release_all 就发不出去了，
+    // 被控端会残留按下的修饰键。
+    releaseAllKeys();
     if (ws) {
         manualClose = true;
         try { ws.close(); } catch (_) { /* ignore */ }
@@ -601,6 +799,10 @@ btnReadClipboardEl.addEventListener('click', () => {
     readRemoteClipboard();
 });
 
+btnAutoClipboardEl.addEventListener('click', () => {
+    toggleAutoClipboard();
+});
+
 btnSendAltF4El.addEventListener('click', () => {
     sendSpecialKey('alt_f4');
 });
@@ -650,23 +852,246 @@ async function sendLocalClipboard() {
 /// 读取远端剪切板：向服务端请求，收到 clipboard_data 后写入浏览器剪切板。
 function readRemoteClipboard() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'clipboard_get' }));
+    // 手动拉取也带指纹：重复点按钮时内容没变就不重传正文。
+    // 自动轮询可能正在途中，先清掉它的标记，避免这次响应被当成自动拉取处理。
+    autoPullPending = false;
+    ws.send(JSON.stringify({ type: 'clipboard_get', fingerprint: lastSyncedFingerprint }));
     flashButton(btnReadClipboardEl, '读取中…');
 }
 
 /// 收到远端剪切板内容后写入本地浏览器剪切板。
-async function applyRemoteClipboard(text) {
+async function applyRemoteClipboard(text, fingerprint) {
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
         flashButton(btnReadClipboardEl, '浏览器不支持');
         return;
     }
     try {
         await navigator.clipboard.writeText(text);
+        // 记下已同步内容，避免它再被当作"本地新内容"推回远端（见 lastSyncedText）。
+        lastSyncedText = text;
+        lastSyncedFingerprint = fingerprint || '';
         flashButton(btnReadClipboardEl, '已写入本地 ✓');
     } catch (e) {
         console.warn('写入本地剪切板失败:', e);
         flashButton(btnReadClipboardEl, '写入被拒');
     }
+}
+
+// ========== 自动剪切板同步 ==========
+
+/// 判断这次 keydown 是不是剪切板快捷键，返回 'copy' / 'paste' / null。
+///
+/// 只认 Ctrl（Windows/Linux）和 Meta（macOS）单修饰的组合：带 Shift/Alt 的
+/// 多半是别的快捷键（如 Ctrl+Shift+V 粘为纯文本在被控端自己处理即可）。
+function clipboardActionOf(ev) {
+    if (!autoClipboard) return null;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+    // Ctrl 和 Meta 二者有其一，且不叠加 Shift/Alt。
+    const cmd = ev.ctrlKey !== ev.metaKey;
+    if (!cmd || ev.shiftKey || ev.altKey) return null;
+    if (ev.code === 'KeyC' || ev.code === 'KeyX') return 'copy';
+    if (ev.code === 'KeyV') return 'paste';
+    return null;
+}
+
+/// 补发被延后的 Ctrl+V。
+///
+/// 这里要解决一个时序问题：onKeyDown 虽然已经把真实的 Ctrl 按下透传过了，
+/// 但从那时到这里隔了一次 clipboard_set 往返（兜底路径更是隔了 300ms），
+/// 用户可能已经松开 Ctrl —— 它的 keyup 会照常透传，失焦时 release_all
+/// 也会把它释放。那样这里补的 V 就成了裸 V，会往被控端打进一个字母 v。
+///
+/// 所以按 Ctrl 的实际状态分两种发法，而不是无条件自己包一层：
+/// 用户还按着时只补 V（自己再发一遍 Ctrl 的释放，会把他正按着的 Ctrl 提前
+/// 松掉，之后的 Ctrl+A 就退化成裸 A）；已经松开了才自己成对包一次 Ctrl。
+///
+/// `pressedKeys` 是键盘那边维护的「已透传按下、尚未透传释放」集合，
+/// 真实的 Ctrl 走的是普通按键路径，所以它的状态在这里是准的。
+function sendClipKey() {
+    // 用户此刻真按着的修饰键，要如实带进 modifiers。漏报会让服务端的
+    // reconcile_modifiers 认为「浏览器说它已松」，把被控端对应的键补发释放。
+    // 典型是 macOS 的 Cmd+V：按着的是 MetaLeft，若只报 ['ctrl']，
+    // 服务端会把被控端的 Meta 释放掉，记账和实际短暂不一致。
+    const mods = ['ctrl'];
+    if (pressedKeys.has('MetaLeft') || pressedKeys.has('MetaRight')
+        || pressedKeys.has('OSLeft') || pressedKeys.has('OSRight')) {
+        mods.push('meta');
+    }
+
+    const ctrlHeld = pressedKeys.has('ControlLeft') || pressedKeys.has('ControlRight');
+    if (ctrlHeld) {
+        sendInput({ event: 'key_down', code: 'KeyV', modifiers: mods });
+        sendInput({ event: 'key_up', code: 'KeyV', modifiers: mods });
+        return;
+    }
+    // Ctrl 已松开（或 macOS 下用户按的是 Cmd）：自己成对包一次 Ctrl。
+    // 被控端是 Windows/Linux，Ctrl+V 才是那边的粘贴键，所以 Cmd+V 也注入 Ctrl+V。
+    sendInput({ event: 'key_down', code: 'ControlLeft', modifiers: mods });
+    sendInput({ event: 'key_down', code: 'KeyV', modifiers: mods });
+    sendInput({ event: 'key_up', code: 'KeyV', modifiers: mods });
+    // 末尾释放自己按下的 Ctrl：去掉 'ctrl'，但保留用户仍按着的 meta。
+    sendInput({ event: 'key_up', code: 'ControlLeft', modifiers: mods.filter((m) => m !== 'ctrl') });
+}
+
+/// Ctrl+V：在 paste 事件里拿到本地剪切板文本，推给被控端，再补发粘贴键。
+///
+/// 这是整个方案的关键路径——事件处理器内读 clipboardData 不需要 clipboard-read
+/// 权限、不弹授权浮层（MDN Clipboard_API：事件由用户发起，故 handler 内免检），
+/// 而 readText() 在 Firefox/Safari 每次都会弹 Paste 浮层。
+function onPaste(ev) {
+    if (!pendingPaste) return; // 不是我们拦下的那次粘贴，交给浏览器默认行为
+    pendingPaste = null;
+    clearTimeout(pasteFallbackTimer);
+    ev.preventDefault(); // 画面区不需要浏览器自己插入文本
+
+    const text = (ev.clipboardData || window.clipboardData).getData('text/plain') || '';
+
+    if (!text) {
+        // 剪切板是空的，或装的是图片/文件（本次不支持非文本）。
+        // 仍然把 Ctrl+V 透传出去，让被控端用它自己的剪切板粘贴。
+        sendClipKey();
+        showClipToast('粘贴：本地剪切板无文本');
+        return;
+    }
+
+    // 超限时不推送，但按键照常透传，退化成被控端本地粘贴。
+    const bytes = new TextEncoder().encode(text).length;
+    if (bytes > CLIP_MAX_BYTES) {
+        console.warn(`本地剪切板 ${bytes} 字节超过上限 ${CLIP_MAX_BYTES}，跳过同步`);
+        sendClipKey();
+        showClipToast('粘贴：内容过大，未同步', 'fail');
+        return;
+    }
+
+    if (text === lastSyncedText) {
+        // 两端内容已经一致（通常是刚从远端拉回来的），不必再推一遍。
+        // 这是断开 A→B→A 回环的地方。
+        sendClipKey();
+        showClipToast('粘贴：内容一致，免同步');
+        return;
+    }
+
+    // 顺序有保证：服务端的 WS 循环是顺序 await，clipboard_set 会先把文本写进
+    // 被控端系统剪切板，之后才处理这条 input 消息，所以粘出来的一定是新内容。
+    ws.send(JSON.stringify({ type: 'clipboard_set', text }));
+    lastSyncedText = text;
+    sendClipKey();
+    showClipToast(`已同步到远端（${bytes} 字节）`);
+}
+
+/// Ctrl+C/X：按键已透传，延迟后轮询被控端剪切板，拿到新内容就写入本地。
+///
+/// 要延迟和重试，是因为被控端的复制动作不是瞬时的：按键注入到应用真正把内容
+/// 放进系统剪切板之间有几十到上百毫秒。拉到的还是旧内容就再等一会儿。
+function schedulePullRemoteClipboard() {
+    clearTimeout(pullTimer);
+    pullRetriesLeft = PULL_MAX_RETRIES;
+    showClipToast('正在从远端取…');
+    pullTimer = setTimeout(requestRemoteClipboardForAuto, PULL_FIRST_DELAY_MS);
+}
+
+function requestRemoteClipboardForAuto() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    autoPullPending = true;
+    // 带上已持有内容的指纹：内容没变时服务端回 clipboard_unchanged（几十字节），
+    // 不会把同一份文本在重试里反复下载。
+    ws.send(JSON.stringify({ type: 'clipboard_get', fingerprint: lastSyncedFingerprint }));
+}
+
+/// 处理自动轮询拿回的远端剪切板内容（内容确有变化时服务端才发这条）。
+async function onAutoClipboardData(text, fingerprint) {
+    if (!text || text === lastSyncedText) {
+        // 空剪切板，或内容与已持有的相同（老服务端不认 fingerprint 时会走到这里）。
+        retryPullOrGiveUp();
+        return;
+    }
+    // 拿到了新内容，写入本地剪切板。
+    // 这里仍在 Ctrl+C 的 transient activation 窗口内（总延迟 < 1s，窗口约 5s），
+    // 所以 Firefox/Safari 的 writeText() 也能通过。
+    try {
+        await navigator.clipboard.writeText(text);
+        lastSyncedText = text;
+        lastSyncedFingerprint = fingerprint || '';
+        pullRetriesLeft = 0;
+        showClipToast(`已从远端取回（${text.length} 字符）`);
+    } catch (e) {
+        console.warn('写入本地剪切板失败:', e);
+        pullRetriesLeft = 0;
+        showClipToast('取回失败：浏览器拒绝写入', 'fail');
+    }
+}
+
+/// 远端内容还没变：被控端的复制动作可能没完成，再等一轮。
+///
+/// 服务端回 clipboard_unchanged 时也走这里 —— 那条消息只有几十字节，
+/// 重试的流量代价与正文无关，不会因为剪切板大就反复下载。
+function retryPullOrGiveUp() {
+    if (pullRetriesLeft > 0) {
+        pullRetriesLeft -= 1;
+        clearTimeout(pullTimer);
+        pullTimer = setTimeout(requestRemoteClipboardForAuto, PULL_RETRY_DELAY_MS);
+        return;
+    }
+    // 重试用尽。可能是用户复制的内容本来就和当前剪切板相同，也可能没复制成功。
+    showClipToast('远端剪切板无变化');
+}
+
+/// 右下角浮层提示。剪切板里常有密码，每次自动同步都让用户看见方向和大小。
+function showClipToast(text, state, ms = 2000) {
+    clipToastEl.textContent = text;
+    clipToastEl.dataset.state = state || 'ok';
+    clipToastEl.hidden = false;
+    clearTimeout(showClipToast._timer);
+    showClipToast._timer = setTimeout(() => {
+        clipToastEl.hidden = true;
+    }, ms);
+}
+
+/// 右键菜单弹出时提示一次「右键复制请点工具栏按钮取回」。
+///
+/// 为什么不自动拉取：右键复制走不到键盘事件，前端只知道"用户开了右键菜单"，
+/// 不知道他点的是复制、粘贴还是别的项。自动拉会带来三个问题：
+///   1. 每次右键都发一轮 clipboard_get + 重试，用户的服务器只有 3 Mbps，
+///      白跑的请求要和视频流抢带宽；
+///   2. 拿到内容后得调 writeText()，它要 transient activation。规范上
+///      右键的 mousedown 算 activation（HTML spec 的事件列表不区分按键），
+///      但各引擎对副按键的处理有分歧，拿不准就会变成偶发失败；
+///   3. 用户只是想右键看看菜单就关掉时，远端剪切板会被无意拉到本地。
+/// 所以这里只做提示，拉取由用户点按钮触发 —— 那是确定的手势，writeText() 必过。
+///
+/// 每次连接只提示一次，避免每右键一下都弹。
+function maybeHintRightClickCopy() {
+    if (rightClickHintShown) return;
+    rightClickHintShown = true;
+    showClipToast('右键复制的内容，请点工具栏「读取远端剪切板」取回', 'ok', 4500);
+}
+
+/// 取消所有在途的自动同步状态：待处理的粘贴、兜底定时器、远端轮询。
+/// 失焦、断连、关闭开关都要调，避免定时器在上下文已失效后才落地。
+function cancelPendingClipboardSync() {
+    pendingPaste = null;
+    pasteKeyIntercepted = false;
+    autoPullPending = false;
+    pullRetriesLeft = 0;
+    clearTimeout(pasteFallbackTimer);
+    clearTimeout(pullTimer);
+}
+
+/// 同步开关按钮的文案与置灰状态。
+function syncAutoClipboardLabel() {
+    btnAutoClipboardEl.textContent = `自动剪切板：${autoClipboard ? '开' : '关'}`;
+    btnAutoClipboardEl.dataset.off = autoClipboard ? '0' : '1';
+}
+
+/// 切换自动同步开关。关掉后退回纯手动按钮模式。
+function toggleAutoClipboard() {
+    autoClipboard = !autoClipboard;
+    syncAutoClipboardLabel();
+    if (!autoClipboard) {
+        // 取消在途的轮询，别让关掉之后还有一次拉取落地。
+        cancelPendingClipboardSync();
+    }
+    showClipToast(autoClipboard ? '自动剪切板已开启' : '自动剪切板已关闭');
 }
 
 /// 更新控制区的光标样式
